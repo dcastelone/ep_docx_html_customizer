@@ -1,0 +1,10 @@
+{
+  "parts": [
+    {
+      "name": "ep_docx_html_customizer",
+      "hooks": {
+        "import": "ep_docx_html_customizer/index.js"
+      }
+    }
+  ]
+} 
