@@ -1,5 +1,9 @@
 # ep_docx_html_customizer
 
+
+**EXPERIMENTAL - this is not finished and I'm not sure if it works! I seemed to need this for my custom image & table plugin!
+The main reasoning behind the plugin was the need to have the .docx converter process images as something other than image tags, and process docx tables in a specific way that didn't seem feasible with the existing docx conversion logic.
+
 A plugin for Etherpad that allows customization of how DOCX, DOC, ODT, and ODF files are transformed into HTML. This plugin extends Etherpad's native document import capabilities by providing configurable HTML output transformations. In other words, it stands on top of or replaces the default .docx converter with custom rules.
 
 ## Purpose

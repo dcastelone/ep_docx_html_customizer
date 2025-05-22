@@ -14,6 +14,22 @@ const mime = require('mime');
 
 const logger = log4js.getLogger('ep_docx_html_customizer');
 
+// Helper for stable random ids
+const rand = () => Math.random().toString(36).slice(2, 8);
+
+// encode/decode so JSON can survive as a CSS class token if ever needed
+const enc = (s) => {
+  if (typeof btoa === 'function') {
+    return btoa(s).replace(/\+/g, '-').replace(/\//g, '_'); // Browser
+  } else if (typeof Buffer === 'function') {
+    return Buffer.from(s).toString('base64').replace(/\+/g, '-').replace(/\//g, '_'); // Node.js
+  }
+  logger.warn('[ep_docx_html_customizer] Base64 encoding function (btoa or Buffer) not found.');
+  return s; // Fallback
+};
+
+const DELIMITER = '|'; // Simplified delimiter for internal text representation
+
 /**
  * Import hook
  * Handles the import of DOCX, DOC, ODT, and ODF files, customizing their HTML output.
@@ -131,6 +147,88 @@ exports.import = async (hookName, context) => {
       img.parentNode.replaceChild(fragment, img);
       modified = true;
       logger.debug(`[ep_docx_html_customizer] Converted HTML - Image ${index + 1} replaced with ZWSP-span-ZWSP structure.`);
+    }
+
+    // Phase 3: Table Processing (mimicking ep_tables5/tableImport.js)
+    logger.info(`[ep_docx_html_customizer] Processing converted HTML at ${destFile} for tables.`);
+    const tables = document.querySelectorAll('table');
+    logger.debug(`[ep_docx_html_customizer] Found ${tables.length} table(s) in converted HTML.`);
+
+    if (tables.length > 0) {
+      const tblId = rand(); // Generate one ID for all tables in this import for simplicity, or per table
+      let tableCount = 0;
+
+      tables.forEach((tableNode, tableIndex) => {
+        logger.debug(`[ep_docx_html_customizer] Processing table ${tableIndex + 1}/${tables.length}`);
+        const rows = tableNode.querySelectorAll('tr');
+        if (rows.length === 0) {
+          logger.debug(`[ep_docx_html_customizer] Table ${tableIndex + 1} has no rows, skipping.`);
+          return;
+        }
+
+        const numCols = rows[0] ? Array.from(rows[0].querySelectorAll('td, th')).length : 0;
+        if (numCols === 0) {
+            logger.debug(`[ep_docx_html_customizer] Table ${tableIndex + 1} has no columns in the first row, skipping.`);
+            return;
+        }
+
+        const tableLines = [];
+
+        rows.forEach((rowNode, rowIndex) => {
+          const cells = Array.from(rowNode.querySelectorAll('td, th'));
+          // Ensure all rows have the same number of columns as the first row, pad if necessary
+          const cellContents = Array.from({ length: numCols }, (_, cellIdx) => {
+            const cell = cells[cellIdx];
+            // Preserve inner HTML, strip outer tags of cell, replace newlines with spaces
+            let cellHTML = cell ? cell.innerHTML.replace(/\r\n|\r|\n/g, ' ').trim() : ' '; // space for empty cell
+            // Remove any <p> tags that might be wrapping content within cells after LibreOffice conversion
+            // and just get their innerHTML. This is a common artifact.
+            const tempDiv = document.createElement('div');
+            tempDiv.innerHTML = cellHTML;
+            const pTags = tempDiv.querySelectorAll('p');
+            if (pTags.length === 1 && tempDiv.textContent.trim() === pTags[0].textContent.trim()) {
+                cellHTML = pTags[0].innerHTML.replace(/\r\n|\r|\n/g, ' ').trim();
+            } else if (pTags.length > 0) {
+                // If multiple p tags, join their content. This is a simple heuristic.
+                cellHTML = Array.from(pTags).map(p => p.innerHTML.replace(/\r\n|\r|\n/g, ' ').trim()).join(' ');
+            }
+            return cellHTML || ' '; // Ensure space for truly empty cells
+          });
+
+          const lineText = cellContents.join(DELIMITER);
+          const metadata = {
+            tblId: `${tblId}-${tableIndex}`, // Unique ID per table
+            row: rowIndex,
+            cols: numCols,
+          };
+          const attributeString = JSON.stringify(metadata);
+          const encodedJson = enc(attributeString);
+
+          // Create a new div element for the line
+          const lineDiv = document.createElement('div');
+          // Add the tbljson attribute as a class.
+          // This class will be picked up by aceAttribsToClasses in client_hooks.js
+          lineDiv.className = `tbljson-${encodedJson}`;
+          // Set the innerHTML of the div to the delimited text
+          // This text will be used by acePostWriteDomLineHTML to render the table
+          lineDiv.innerHTML = lineText;
+          tableLines.push(lineDiv);
+          logger.debug(`[ep_docx_html_customizer] Table ${tableIndex + 1}, Row ${rowIndex + 1}: Created div with class tbljson-${encodedJson} and text "${lineText.substring(0,50)}..."`);
+        });
+
+        if (tableLines.length > 0) {
+          const fragment = document.createDocumentFragment();
+          tableLines.forEach(lineDiv => fragment.appendChild(lineDiv));
+          // Replace the original table with the new divs
+          tableNode.parentNode.replaceChild(fragment, tableNode);
+          modified = true;
+          tableCount++;
+          logger.debug(`[ep_docx_html_customizer] Table ${tableIndex + 1} replaced with ${tableLines.length} div elements.`);
+        }
+      });
+      if (tableCount > 0) {
+        logger.info(`[ep_docx_html_customizer] Successfully processed and replaced ${tableCount} table(s).`);
+      }
     }
 
     if (modified) {
