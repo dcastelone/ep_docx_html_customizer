@@ -180,17 +180,17 @@ exports.import = async (hookName, context) => {
           const cellContents = Array.from({ length: numCols }, (_, cellIdx) => {
             const cell = cells[cellIdx];
             // Preserve inner HTML, strip outer tags of cell, replace newlines with spaces
-            let cellHTML = cell ? cell.innerHTML.replace(/\r\n|\r|\n/g, ' ').trim() : ' '; // space for empty cell
+            let cellHTML = cell ? cell.innerHTML.replace(/\r\n|\r|\n|\t|,/g, ' ').trim() : ' '; // space for empty cell
             // Remove any <p> tags that might be wrapping content within cells after LibreOffice conversion
             // and just get their innerHTML. This is a common artifact.
             const tempDiv = document.createElement('div');
             tempDiv.innerHTML = cellHTML;
             const pTags = tempDiv.querySelectorAll('p');
             if (pTags.length === 1 && tempDiv.textContent.trim() === pTags[0].textContent.trim()) {
-                cellHTML = pTags[0].innerHTML.replace(/\r\n|\r|\n/g, ' ').trim();
+                cellHTML = pTags[0].innerHTML.replace(/\r\n|\r|\n|\t|,/g, ' ').trim();
             } else if (pTags.length > 0) {
                 // If multiple p tags, join their content. This is a simple heuristic.
-                cellHTML = Array.from(pTags).map(p => p.innerHTML.replace(/\r\n|\r|\n/g, ' ').trim()).join(' ');
+                cellHTML = Array.from(pTags).map(p => p.innerHTML.replace(/\r\n|\r|\n|\t|,/g, ' ').trim()).join(' ');
             }
             return cellHTML || ' '; // Ensure space for truly empty cells
           });
