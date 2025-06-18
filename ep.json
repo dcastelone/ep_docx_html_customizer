@@ -3,7 +3,14 @@
     {
       "name": "ep_docx_html_customizer",
       "hooks": {
-        "import": "ep_docx_html_customizer/index.js"
+        "import": "ep_docx_html_customizer/index.js",
+        "collectContentPre": "ep_docx_html_customizer/fixOrderedList.js",
+        "collectContentPost": "ep_docx_html_customizer/fixOrderedList.js"
+      },
+      "client_hooks": {
+        "aceKeyEvent": "ep_docx_html_customizer/static/js/listSoftBreak.js",
+        "aceAttribsToClasses": "ep_docx_html_customizer/static/js/listSoftBreak.js",
+        "aceEditorCSS": "ep_docx_html_customizer/static/js/listSoftBreak.js"
       }
     }
   ]
