@@ -98,18 +98,23 @@ exports.import = async (hookName, context) => {
     logger.debug(`[ep_docx_html_customizer] Found ${headingElements.length} heading element(s).`);
     
     headingElements.forEach((heading, idx) => {
-      // Ensure line break after each heading to prevent content merging
+      // Ensure line breaks before and after each heading to prevent content merging
       const parent = heading.parentNode;
-      const br = document.createElement('br');
       
+      // Add line break before the heading
+      const brBefore = document.createElement('br');
+      parent.insertBefore(brBefore, heading);
+      
+      // Add line break after the heading
+      const brAfter = document.createElement('br');
       if (heading.nextSibling) {
-        parent.insertBefore(br, heading.nextSibling);
+        parent.insertBefore(brAfter, heading.nextSibling);
       } else {
-        parent.appendChild(br);
+        parent.appendChild(brAfter);
       }
       
       modified = true;
-      logger.debug(`[ep_docx_html_customizer] Added line break after ${heading.tagName.toLowerCase()} element ${idx + 1}.`);
+      logger.debug(`[ep_docx_html_customizer] Added line breaks before and after ${heading.tagName.toLowerCase()} element ${idx + 1}.`);
     });
 
     /* ───────────────────────────── Alignment processing ───────────────────────────── */
@@ -145,24 +150,100 @@ exports.import = async (hookName, context) => {
 
       const wrapperTag = ALIGN_MAP[alignVal];
       const newEl = document.createElement(wrapperTag);
-
-      // Preserve the HTML content instead of just moving nodes
-      newEl.innerHTML = blk.innerHTML;
-
-      // Replace the block and ensure line break after
       const parent = blk.parentNode;
-      parent.replaceChild(newEl, blk);
+
+      const isHeading = /^h[1-6]$/i.test(blk.tagName);
+
+      if (isHeading) {
+        // Keep heading tag intact by nesting it
+        parent.replaceChild(newEl, blk);
+        newEl.appendChild(blk);
+
+        // Remove redundant alignment from heading itself
+        blk.removeAttribute('align');
+        if (blk.style) blk.style.removeProperty('text-align');
+      } else {
+        // For regular paragraphs or other blocks, drop the original tag and just keep content
+        newEl.innerHTML = blk.innerHTML;
+        parent.replaceChild(newEl, blk);
+      }
       
-      // Add explicit line break after aligned block to prevent merging
+      modified = true;
+      logger.debug(`[ep_docx_html_customizer] Wrapped element ${idx + 1} with <${wrapperTag}> and added line break.`);
+
+      // Add explicit line break after the aligned wrapper to keep lines separate
       const br = document.createElement('br');
       if (newEl.nextSibling) {
         parent.insertBefore(br, newEl.nextSibling);
       } else {
         parent.appendChild(br);
       }
-      
+    });
+
+    /* ─────────────────────────── Ordered list flattening ─────────────────────────── */
+    logger.info(`[ep_docx_html_customizer] Converting ordered lists (<ol>) to plain numbered paragraphs.`);
+
+    const processOrderedList = (olNode, depth = 0) => {
+      const startAttr = parseInt(olNode.getAttribute('start') || '1', 10);
+      let counter = isNaN(startAttr) ? 1 : startAttr;
+
+      // Collect new paragraph nodes
+      const frag = document.createDocumentFragment();
+
+      Array.from(olNode.children).forEach((child) => {
+        if (child.tagName && child.tagName.toLowerCase() === 'li') {
+          // Build prefix (e.g., "1. ")
+          const prefixSpan = document.createElement('span');
+          prefixSpan.textContent = `${counter}. `;
+
+          // Create wrapper paragraph <div>
+          const p = document.createElement('div');
+          // Preserve nested content inside <li>
+          const liClone = child.cloneNode(true);
+
+          // Remove any nested ordered lists before cloning (they will be handled recursively)
+          const nestedOLs = liClone.querySelectorAll('ol');
+          nestedOLs.forEach((nested) => {
+            const replacement = processOrderedList(nested, depth + 1);
+            nested.parentNode.replaceChild(replacement, nested);
+          });
+
+          // Move all children from liClone into wrapper, but unwrap a single wrapping <p>
+          if (liClone.childNodes.length === 1 && liClone.firstChild.tagName && liClone.firstChild.tagName.toLowerCase() === 'p') {
+            const innerP = liClone.firstChild;
+            while (innerP.firstChild) {
+              p.appendChild(innerP.firstChild);
+            }
+          } else {
+            while (liClone.firstChild) {
+              p.appendChild(liClone.firstChild);
+            }
+          }
+
+          // Prepend number prefix
+          p.insertBefore(prefixSpan, p.firstChild);
+
+          // Optionally indent child paragraphs depending on depth
+          if (depth > 0) p.style.marginLeft = `${depth * 1.5}em`;
+
+          frag.appendChild(p);
+
+          // No explicit <br>; <div> itself creates a new line in Etherpad
+
+          counter += 1;
+        }
+      });
+
       modified = true;
-      logger.debug(`[ep_docx_html_customizer] Wrapped element ${idx + 1} with <${wrapperTag}> and added line break.`);
+      return frag;
+    };
+
+    const allOrderedLists = document.querySelectorAll('ol');
+    logger.debug(`[ep_docx_html_customizer] Found ${allOrderedLists.length} ordered list(s) to flatten.`);
+
+    Array.from(allOrderedLists).forEach((ol) => {
+      const replacementFrag = processOrderedList(ol);
+      ol.parentNode.replaceChild(replacementFrag, ol);
     });
 
     /* ─────────────────────────────── Image processing ─────────────────────────────── */
@@ -424,51 +505,109 @@ exports.import = async (hookName, context) => {
           return;
         }
 
-        const numCols = rows[0] ? Array.from(rows[0].querySelectorAll('td, th')).length : 0;
+        // Determine logical column count: honour colspan and consider every row, then take the max.
+        const getLogicalColCount = (tr) => {
+          return Array.from(tr.querySelectorAll('td, th')).reduce((count, cell) => {
+            const span = parseInt(cell.getAttribute('colspan') || '1', 10);
+            return count + (isNaN(span) || span < 1 ? 1 : span);
+          }, 0);
+        };
+
+        const numCols = Array.from(rows).reduce((max, tr) => {
+          const cols = getLogicalColCount(tr);
+          return cols > max ? cols : max;
+        }, 0);
+
         if (numCols === 0) {
-            logger.debug(`[ep_docx_html_customizer] Table ${tableIndex + 1} has no columns in the first row, skipping.`);
+            logger.debug(`[ep_docx_html_customizer] Table ${tableIndex + 1} appears to have zero columns after analysis, skipping.`);
             return;
         }
 
         const tableLines = [];
 
-        rows.forEach((rowNode, rowIndex) => {
-          const cells = Array.from(rowNode.querySelectorAll('td, th'));
-          // Ensure all rows have the same number of columns as the first row, pad if necessary
-          const cellContents = Array.from({ length: numCols }, (_, cellIdx) => {
-            const cell = cells[cellIdx];
-            // Obtain the raw HTML inside the cell and normalise whitespace/newlines.
-            let cellHTML = cell ? cell.innerHTML.replace(/\r\n|\r|\n/g, ' ').trim() : '';
+        // Track vertical merges that must propagate blank cells downward
+        const pendingRowspan = Array(numCols).fill(0);
 
-            // Remove any <p> tags that might be wrapping content within cells after LibreOffice conversion.
-            // This is a common artifact we want to flatten.
+        rows.forEach((rowNode, rowIndex) => {
+          const rawCells = Array.from(rowNode.querySelectorAll('td, th'));
+          let rawPtr = 0;
+          const cellContents = new Array(numCols);
+
+          for (let col = 0; col < numCols; col++) {
+            // 1) Handle continuation of a rowspan merge
+            if (pendingRowspan[col] > 0) {
+              pendingRowspan[col]--;
+              cellContents[col] = ' <span>&nbsp;</span>';
+              continue;
+            }
+
+            const cell = rawCells[rawPtr++];
+            if (!cell) {
+              cellContents[col] = ' <span>&nbsp;</span>';
+              continue;
+            }
+
+            // ───── Extract colspan/rowspan safely ─────
+            let colspan = parseInt(cell.getAttribute('colspan') || '1', 10);
+            let rowspan = parseInt(cell.getAttribute('rowspan') || '1', 10);
+            if (isNaN(colspan) || colspan < 1) colspan = 1;
+            if (isNaN(rowspan) || rowspan < 1) rowspan = 1;
+
+            // ───── Normalise inner HTML (logic from previous version) ─────
+            let cellHTML = cell.innerHTML.replace(/\r\n|\r|\n/g, ' ').trim();
+
             const tempDiv = document.createElement('div');
             tempDiv.innerHTML = cellHTML;
             const pTags = tempDiv.querySelectorAll('p');
             if (pTags.length === 1 && tempDiv.textContent.trim() === pTags[0].textContent.trim()) {
               cellHTML = pTags[0].innerHTML.replace(/\r\n|\r|\n/g, ' ').trim();
             } else if (pTags.length > 0) {
-              // If multiple p tags exist, join their content as a simple heuristic.
               cellHTML = Array.from(pTags).map(p => p.innerHTML.replace(/\r\n|\r|\n/g, ' ').trim()).join(' ');
             }
 
-            // After flattening <p> wrappers, strip lone <br> tags (LibreOffice's way
-            // of representing empty cells). Treat cells with only <br> as truly empty.
             if (cellHTML === '<br>' || cellHTML === '<br/>' || cellHTML === '<br />') {
               cellHTML = '';
-              logger.debug(`[ep_docx_html_customizer] Table ${tableIndex + 1}, Row ${rowIndex + 1}, Col ${cellIdx + 1}: stripped lone <br> tag, treating as empty`);
             }
 
-            // If the cell is empty after all normalisation, inject a non-breaking space in a span.
-            // Using &nbsp; prevents the browser from collapsing whitespace and closely matches the
-            // markup generated by ep_tables5 for blank cells.
+            if (cellHTML) {
+              cellHTML = cellHTML.replace(/(<br\s*\/?>\s*)+$/gi, '').trim();
+              if (cellHTML.includes('<br')) {
+                cellHTML = cellHTML.replace(/<br\s*\/?>/gi, ' ');
+              }
+            }
+
+            let isVisiblyEmpty = false;
             if (!cellHTML) {
-              cellHTML = '<span>&nbsp;</span>';
-              logger.debug(`[ep_docx_html_customizer] Table ${tableIndex + 1}, Row ${rowIndex + 1}, Col ${cellIdx + 1}: inserted &nbsp; placeholder span in empty cell`);
+              isVisiblyEmpty = true;
+            } else {
+              const probeDiv = document.createElement('div');
+              probeDiv.innerHTML = cellHTML;
+              const text = (probeDiv.textContent || '').replace(/\u00A0/g, '').trim();
+              isVisiblyEmpty = text === '';
             }
-            return cellHTML;
-          });
 
+            if (isVisiblyEmpty) {
+              cellHTML = ' <span>&nbsp;</span>';
+            }
+
+            // Place main cell content
+            cellContents[col] = cellHTML;
+
+            // Register vertical merge
+            if (rowspan > 1) {
+              pendingRowspan[col] = rowspan - 1;
+            }
+
+            // Handle colspan by filling following columns with blanks and also tracking rowspan
+            for (let extra = 1; extra < colspan && col + extra < numCols; extra++) {
+              cellContents[col + extra] = ' <span>&nbsp;</span>';
+              if (rowspan > 1) pendingRowspan[col + extra] = rowspan - 1;
+            }
+
+            // Skip over columns we just filled via colspan
+            col += colspan - 1;
+          }
+           
           const lineText = cellContents.join(DELIMITER);
           const metadata = {
             tblId: `${tblId}-${tableIndex}`, // Unique ID per table
