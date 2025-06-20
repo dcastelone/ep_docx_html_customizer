@@ -739,13 +739,57 @@ exports.expressCreateServer = (hookName, {app}) => {
   console.log('[docx_customizer] expressCreateServer – setting up /ep_docx_image_proxy');
   logger.info('[ep_docx_html_customizer] expressCreateServer hook: registering /ep_docx_image_proxy route');
   const FETCH_TIMEOUT_MS = 10000;
+  const RATE_LIMIT_WINDOW_MS = 60 * 1000;          // 1 minute sliding window
+  const RATE_LIMIT_MAX_REQUESTS = 30;               // max requests per IP within the window
+  const MAX_CONTENT_LENGTH = 10 * 1024 * 1024;      // 10 MB hard size limit
+  // Simple in-memory store {ip: [timestamp,…]}. Good enough for single-node deployments.
+  const _rateLimitStore = new Map();
+
+  // Helper to test whether a host looks like a private / loopback address we should refuse.
+  const _isForbiddenHost = (host) => {
+    if (!host) return true;
+    const lc = host.toLowerCase();
+    // block localhost & obvious loopback labels
+    if (lc === 'localhost' || lc === '::1') return true;
+    // IPv4 private / link-local ranges & loopback
+    return /^(127\.|10\.|0\.|169\.254\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.)/.test(lc);
+  };
 
   app.get('/ep_docx_image_proxy', async (req, res) => {
+    // Require Etherpad session (authenticated user or guest author).
+    if (!req.session || (!req.session.user && !req.session.authorId)) {
+      res.status(401).send('Authentication required');
+      return;
+    }
     const url = req.query.url;
     if (!url || !/^https?:\/\//i.test(url)) {
       res.status(400).send('Bad url');
       return;
     }
+
+    // Block requests targeting private or loopback hosts to mitigate SSRF.
+    try {
+      const {hostname} = new URL(url);
+      if (_isForbiddenHost(hostname)) {
+        res.status(400).send('Forbidden host');
+        return;
+      }
+    } catch (_) {
+      res.status(400).send('Malformed url');
+      return;
+    }
+
+    // Primitive per-IP rate limiter (in-memory).
+    const ip = req.ip || req.headers['x-forwarded-for'] || req.connection?.remoteAddress || 'unknown';
+    const now = Date.now();
+    let timestamps = _rateLimitStore.get(ip) || [];
+    timestamps = timestamps.filter((t) => t > now - RATE_LIMIT_WINDOW_MS);
+    if (timestamps.length >= RATE_LIMIT_MAX_REQUESTS) {
+      res.status(429).send('Too many requests, slow down');
+      return;
+    }
+    timestamps.push(now);
+    _rateLimitStore.set(ip, timestamps);
 
     const fetch = _getFetch();
     if (!fetch) {
@@ -765,6 +809,13 @@ exports.expressCreateServer = (hookName, {app}) => {
 
       if (!resp.ok) {
         res.status(resp.status).send('Upstream error');
+        return;
+      }
+
+      // Reject very large payloads to avoid memory/bandwidth abuse.
+      const respLen = parseInt(resp.headers.get('content-length') || '0', 10);
+      if (respLen && respLen > MAX_CONTENT_LENGTH) {
+        res.status(413).send('Payload too large');
         return;
       }
 
