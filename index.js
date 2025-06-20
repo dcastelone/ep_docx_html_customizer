@@ -64,7 +64,7 @@ exports.import = async (hookName, context) => {
     const converterPath = settings.soffice;
     const outDir = path.dirname(destFile);
     const tempConvertedBaseName = `${path.basename(srcFile, fileEnding)}.html`;
-    const actualConvertedTmpFile = path.join(outDir, tempConvertedBaseName);
+    let actualConvertedTmpFile = path.join(outDir, tempConvertedBaseName);
 
     const conversionCommand = `"${converterPath}" --headless --invisible --nologo --nolockcheck --writer --convert-to html "${srcFile}" --outdir "${outDir}"`;
     logger.debug(`[ep_docx_html_customizer] Executing soffice command: ${conversionCommand}`);
@@ -72,9 +72,35 @@ exports.import = async (hookName, context) => {
     await execPromise(conversionCommand);
     logger.info(`[ep_docx_html_customizer] LibreOffice conversion successful. HTML output at: ${actualConvertedTmpFile}`);
 
+    // ─── Fallback lookup ────────────────────────────────────────────────────────
     if (!fs.existsSync(actualConvertedTmpFile)) {
-      logger.error(`[ep_docx_html_customizer] Conversion failed: ${actualConvertedTmpFile} not found after soffice execution.`);
-      return false;
+      /*
+       * Some temporary upload names no longer end with the real extension
+       * (e.g. `/tmp/abcd.odt.5`). LibreOffice will therefore drop the extra
+       * suffix and produce `/tmp/abcd.html`, not `/tmp/abcd.5.html`.
+       * If our first guess is missing, scan the outDir for any fresh *.html
+       * file produced by this conversion run and pick the most recent one.
+       */
+      try {
+        const htmlFiles = fs.readdirSync(outDir)
+          .filter(f => f.toLowerCase().endsWith('.html'))
+          .map(f => path.join(outDir, f))
+          // sort newest first by mtime
+          .sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
+
+        if (htmlFiles.length > 0) {
+          const candidate = htmlFiles[0];
+          logger.warn(`[ep_docx_html_customizer] Expected converted file not found; using fallback candidate ${candidate}`);
+          actualConvertedTmpFile = candidate;
+        }
+      } catch (e) {
+        logger.error('[ep_docx_html_customizer] Error while searching for fallback HTML file:', e);
+      }
+
+      if (!fs.existsSync(actualConvertedTmpFile)) {
+        logger.error(`[ep_docx_html_customizer] Conversion failed: could not locate any converted HTML file (looked for ${actualConvertedTmpFile}).`);
+        return false;
+      }
     }
 
     if (actualConvertedTmpFile !== destFile) {
@@ -558,12 +584,39 @@ exports.import = async (hookName, context) => {
 
             const tempDiv = document.createElement('div');
             tempDiv.innerHTML = cellHTML;
-            const pTags = tempDiv.querySelectorAll('p');
-            if (pTags.length === 1 && tempDiv.textContent.trim() === pTags[0].textContent.trim()) {
-              cellHTML = pTags[0].innerHTML.replace(/\r\n|\r|\n/g, ' ').trim();
-            } else if (pTags.length > 0) {
-              cellHTML = Array.from(pTags).map(p => p.innerHTML.replace(/\r\n|\r|\n/g, ' ').trim()).join(' ');
+            const headingEl = tempDiv.querySelector('h1, h2, h3, h4, h5, h6');
+            if (headingEl) {
+              // Collect existing classes that colour / size mapping added earlier.
+              const existingClasses = (headingEl.className || '').split(/\s+/).filter(Boolean);
+              if (!existingClasses.includes('bold')) existingClasses.push('bold');
+
+              // Build a <span> with the combined classes and the heading's inner HTML.
+              const span = document.createElement('span');
+              span.className = existingClasses.join(' ');
+              span.innerHTML = headingEl.innerHTML.replace(/\r\n|\r|\n/g, ' ').trim();
+
+              // Replace the heading element inside the tempDiv.
+              headingEl.parentNode.replaceChild(span, headingEl);
             }
+
+            /* ── Paragraph flattening ─────────────────────────────────────────── */
+            const flattenParagraphs = (div) => {
+              const parts = [];
+              div.childNodes.forEach((node) => {
+                if (node.nodeType === 3) { // text
+                  const txt = node.textContent.replace(/\r\n|\r|\n/g, ' ').trim();
+                  if (txt) parts.push(txt);
+                } else if (node.tagName && node.tagName.toLowerCase() === 'p') {
+                  const inner = node.innerHTML.replace(/\r\n|\r|\n/g, ' ').trim();
+                  if (inner) parts.push(inner);
+                } else if (node.outerHTML) {
+                  parts.push(node.outerHTML.replace(/\r\n|\r|\n/g, ' ').trim());
+                }
+              });
+              return parts.join(' ').trim();
+            };
+
+            cellHTML = flattenParagraphs(tempDiv);
 
             if (cellHTML === '<br>' || cellHTML === '<br/>' || cellHTML === '<br />') {
               cellHTML = '';
@@ -657,4 +710,79 @@ exports.import = async (hookName, context) => {
     logger.error(`[ep_docx_html_customizer] Error during document processing for ${srcFile}:`, err);
     return false; // Signal that the import failed or was not fully handled
   }
+};
+
+// ============================================================================
+// expressCreateServer – install same-origin image proxy to bypass CORS
+// ============================================================================
+
+let _fetchImpl; // lazy-loaded fetch replacement when global fetch is absent
+const _getFetch = () => {
+  if (typeof global.fetch === 'function') return global.fetch;
+  if (!_fetchImpl) {
+    try {
+      // Dynamically import node-fetch (v3 is ESM-only)
+      _fetchImpl = (...args) => import('node-fetch').then(m => (m.default || m)(...args));
+    } catch (e) {
+      logger.warn('[ep_docx_html_customizer] node-fetch is not available and global fetch is missing.');
+    }
+  }
+  return _fetchImpl;
+};
+
+/**
+ * expressCreateServer hook – adds /ep_docx_image_proxy?url=…
+ * This endpoint streams remote images back to the browser with permissive
+ * CORS headers so that client-side code can convert them into data URIs.
+ */
+exports.expressCreateServer = (hookName, {app}) => {
+  console.log('[docx_customizer] expressCreateServer – setting up /ep_docx_image_proxy');
+  logger.info('[ep_docx_html_customizer] expressCreateServer hook: registering /ep_docx_image_proxy route');
+  const FETCH_TIMEOUT_MS = 10000;
+
+  app.get('/ep_docx_image_proxy', async (req, res) => {
+    const url = req.query.url;
+    if (!url || !/^https?:\/\//i.test(url)) {
+      res.status(400).send('Bad url');
+      return;
+    }
+
+    const fetch = _getFetch();
+    if (!fetch) {
+      res.status(500).send('fetch unavailable');
+      return;
+    }
+
+    try {
+      let controller;
+      let timer;
+      if (typeof AbortController === 'function') {
+        controller = new AbortController();
+        timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+      }
+      const resp = await fetch(url, controller ? {signal: controller.signal} : {});
+      if (timer) clearTimeout(timer);
+
+      if (!resp.ok) {
+        res.status(resp.status).send('Upstream error');
+        return;
+      }
+
+      res.set({
+        'Content-Type': resp.headers.get('content-type') || 'application/octet-stream',
+        'Cache-Control': 'public, max-age=86400',
+        'Access-Control-Allow-Origin': '*',
+      });
+
+      if (resp.body && typeof resp.body.pipe === 'function') {
+        resp.body.pipe(res);
+      } else {
+        const buf = Buffer.from(await resp.arrayBuffer());
+        res.end(buf);
+      }
+    } catch (e) {
+      logger.warn('[ep_docx_html_customizer] Proxy error', e);
+      res.status(e.name === 'AbortError' ? 504 : 502).send('Proxy error');
+    }
+  });
 }; 

@@ -1,9 +1,14 @@
 {
   "parts": [
     {
-      "name": "ep_docx_html_customizer",
+      "name": "main",
+      "post": ["ep_hyperlinked_text/main"],
       "hooks": {
-        "import": "ep_docx_html_customizer/index.js"
+        "import": "ep_docx_html_customizer/index.js",
+        "expressCreateServer": "ep_docx_html_customizer/index.js"
+      },
+      "client_hooks": {
+        "postAceInit": "ep_docx_html_customizer/static/js/clipboard"
       }
     }
   ]
