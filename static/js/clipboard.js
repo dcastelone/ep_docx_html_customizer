@@ -157,7 +157,7 @@ exports.postAceInit = (hook, context) => {
 
               // Validate that selection is within the current cell (same logic as before)
               const selStart = repNow.selStart.slice();
-              const selEnd   = repNow.selEnd.slice();
+              let selEnd   = repNow.selEnd.slice();
               const lineNum  = selStart[0];
 
               const lineText = repNow.lines.atIndex(lineNum)?.text || '';
@@ -185,37 +185,128 @@ exports.postAceInit = (hook, context) => {
                 return;
               }
 
-              // --- Convert HTML to plain text (strip tags) ---
-              const tmp = document.createElement('div');
-              tmp.innerHTML = finalHtml;
-              let plainText = tmp.textContent || tmp.innerText || '';
+              // === Extract hyperlink-aware segments from HTML (borrowed from ep_hyperlinked_text) ===
+              const tempDivSeg = document.createElement('div');
+              tempDivSeg.innerHTML = finalHtml;
 
-              // Sanitize similar to ep_tables5
-              plainText = plainText
-                .replace(/(\r\n|\n|\r)/gm, ' ')
-                .replace(new RegExp(DELIMITER, 'g'), ' ') // Strip delimiter char
-                .replace(/\t/g, ' ') // Tabs to space
-                .replace(/\s+/g, ' ') // Collapse whitespace
-                .trim();
+              const segments = [];
+              const extractSegmentsRecursive = (node, inheritedUrl) => {
+                if (node.nodeType === Node.TEXT_NODE) {
+                  segments.push({text: node.textContent || '', url: inheritedUrl});
+                } else if (node.nodeType === Node.ELEMENT_NODE) {
+                  let currentUrl = inheritedUrl;
+                  if (node.nodeName === 'A' && node.getAttribute('href')) {
+                    let href = node.getAttribute('href');
+                    if (href && href.trim() !== '' && !href.trim().toLowerCase().startsWith('javascript:')) {
+                      if (!/^(https?:\/\/|mailto:|ftp:|file:|#|\/)/i.test(href)) {
+                        href = `http://${href}`;
+                      }
+                      currentUrl = href;
+                    }
+                  }
+                  // Detect span with hyperlink classes (produced by customizeDocument)
+                  if (!currentUrl && node.classList) {
+                    const m = Array.from(node.classList).find(c => c.startsWith('hyperlink-'));
+                    if (m) {
+                      try { currentUrl = decodeURIComponent(m.slice('hyperlink-'.length)); } catch {}
+                    }
+                  }
+                  for (let i = 0; i < node.childNodes.length; i++) {
+                    extractSegmentsRecursive(node.childNodes[i], currentUrl);
+                  }
+                }
+              };
 
-              if (!plainText) {
-                if (DEBUG) console.log('[docx_customizer] Plaintext empty after sanitization – abort paste');
+              for (let i = 0; i < tempDivSeg.childNodes.length; i++) {
+                extractSegmentsRecursive(tempDivSeg.childNodes[i], null);
+              }
+
+              if (segments.length === 0 && tempDivSeg.textContent) {
+                segments.push({text: tempDivSeg.textContent, url: null});
+              }
+
+              // Sanitize each segment and filter empties
+              segments.forEach((seg) => {
+                seg.text = (seg.text || '')
+                  .replace(/(\r\n|\n|\r)/gm, ' ')
+                  .replace(new RegExp(DELIMITER, 'g'), ' ')
+                  .replace(/\t/g, ' ')
+                  .replace(/\s+/g, ' ')
+                  .trim();
+              });
+              const cleanedSegments = segments.filter((s) => s.text.length > 0);
+              if (cleanedSegments.length === 0) {
+                if (DEBUG) console.log('[docx_customizer] No text after sanitization – abort paste');
                 return;
               }
 
-              // Length cap same as tables plugin
-              const currentCellText = cells[targetCellIndex] || '';
+              // Enforce maximum cell length like ep_tables5
               const selectionLength = selEnd[1] - selStart[1];
+              const currentCellText = cells[targetCellIndex] || '';
               const MAX_CELL_LENGTH = 8000;
-              const newCellLength = currentCellText.length - selectionLength + plainText.length;
-              if (newCellLength > MAX_CELL_LENGTH) {
-                plainText = plainText.substring(0, MAX_CELL_LENGTH - (currentCellText.length - selectionLength));
+              let remaining = MAX_CELL_LENGTH - (currentCellText.length - selectionLength);
+              if (remaining <= 0) {
+                if (DEBUG) console.log('[docx_customizer] Cell at max length – abort paste');
+                return;
               }
 
-              // Perform replacement
-              ace.ace_performDocumentReplaceRange(selStart, selEnd, plainText);
+              // ================= EXACT insertion loop from ep_hyperlinked_text (isTableLine forced true) =================
+              let selStartMod = selStart.slice();
+              let selEndMod   = selEnd.slice();
 
-              // Reapply tbljson metadata
+              if (selStartMod[0] !== selEndMod[0] || selStartMod[1] !== selEndMod[1]) {
+                ace.ace_performDocumentReplaceRange(selStartMod, selEndMod, '');
+                selEndMod = selStartMod.slice();
+              }
+
+              let currentLine = selStartMod[0];
+              let currentCol  = selStartMod[1];
+
+              if (DEBUG) console.log('[docx_customizer] cleanedSegments', cleanedSegments.length, cleanedSegments);
+
+              for (let segIdx = 0; segIdx < cleanedSegments.length; segIdx++) {
+                const segment = cleanedSegments[segIdx];
+                let textToInsert = segment.text;
+                textToInsert = textToInsert.replace(/\n+/g, ' '); // table line flatten
+
+                // Conditional leading space (same as hyperlinked plugin)
+                if (segIdx > 0) {
+                  const previousSegment = cleanedSegments[segIdx - 1];
+                  if (previousSegment.text.length > 0 && textToInsert.length > 0 && !/\s$/.test(previousSegment.text) && !/^\s/.test(textToInsert)) {
+                    if (DEBUG) console.log(`[docx_customizer] seg${segIdx}: inserting leading space at L${currentLine}C${currentCol}`);
+                    ace.ace_performDocumentReplaceRange([currentLine, currentCol], [currentLine, currentCol], ' ');
+                    const repAfterSpace = ace.ace_getRep();
+                    currentLine = repAfterSpace.selEnd[0];
+                    currentCol  = repAfterSpace.selEnd[1];
+                  }
+                }
+
+                if (textToInsert.length > 0) {
+                  if (DEBUG) console.log(`[docx_customizer] seg${segIdx}: inserting text "${textToInsert.slice(0,80)}" (len ${textToInsert.length}) url=${segment.url || 'none'} at L${currentLine}C${currentCol}`);
+                  const insertStart = [currentLine, currentCol];
+                  ace.ace_performDocumentReplaceRange(insertStart, insertStart, textToInsert);
+
+                  const repAfterTxt = ace.ace_getRep();
+                  const insertEndLine = repAfterTxt.selEnd[0];
+                  const insertEndCol  = repAfterTxt.selEnd[1];
+
+                  if (segment.url) {
+                    if (DEBUG) console.log(`[docx_customizer] seg${segIdx}: applying hyperlink attr to range L${insertStart[0]}C${insertStart[1]} - L${insertEndLine}C${insertEndCol}`);
+                    try {
+                      ace.ace_performDocumentApplyAttributesToRange(insertStart, [insertEndLine, insertEndCol], [['hyperlink', segment.url]]);
+                    } catch (attrErr) {
+                      console.warn('[docx_customizer] Failed to apply hyperlink attribute', attrErr);
+                    }
+                  }
+
+                  if (DEBUG) console.log(`[docx_customizer] seg${segIdx}: after insertion caret at L${insertEndLine}C${insertEndCol}`);
+                  currentLine = insertEndLine;
+                  currentCol  = insertEndCol;
+                }
+              }
+              if (DEBUG) console.log('[docx_customizer] Finished segment loop. Final caret', currentLine, currentCol);
+
+              // Reapply tbljson metadata after paste
               if (ace.ep_tables5_applyMeta && tableMetaBefore && typeof tableMetaBefore.cols === 'number') {
                 const repAfter = ace.ace_getRep();
                 const docMgrSafe = docMgrPre;
@@ -231,13 +322,10 @@ exports.postAceInit = (hook, context) => {
                 );
               }
 
-              // Move caret to end of inserted text
-              const newCaretCol = selStart[1] + plainText.length;
-              ace.ace_performSelectionChange([lineNum, newCaretCol], [lineNum, newCaretCol], false);
-
+              ace.ace_performSelectionChange([currentLine, currentCol], [currentLine, currentCol], false);
               ace.ace_fastIncorp && ace.ace_fastIncorp(10);
 
-              if (DEBUG) console.log('[docx_customizer] Plain-text table-cell paste completed');
+              if (DEBUG) console.log('[docx_customizer] Hyperlink-aware table-cell paste completed');
 
             } catch (errPaste) {
               console.error('[docx_customizer] error during plain-text table paste', errPaste);
