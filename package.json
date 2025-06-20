@@ -1,6 +1,6 @@
 {
   "name": "ep_docx_html_customizer",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Customize how DOCX, DOC, ODT, and ODF files are transformed into HTML in Etherpad - currently hardcoded for compatibility with my images, tables, hyperlinks plugins.",
   "author": {
     "name": "dcastelone"
@@ -19,7 +19,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/yourusername/ep_docx_html_customizer"
+    "url": "https://github.com/dcastelone/ep_docx_html_customizer"
   },
   "license": "Apache-2.0"
 }

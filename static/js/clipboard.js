@@ -6,6 +6,10 @@
 
 const {customizeDocument} = require('../../transform_common');
 
+// ADD: Constants matching ep_tables5 for table detection & delimiter cleanup
+const ATTR_TABLE_JSON = 'tbljson';
+const DELIMITER = '\u241F'; // same invisible delimiter used by ep_tables5
+
 exports.postAceInit = (hook, context) => {
   console.log('[docx_customizer] postAceInit invoked – clipboard customization ready');
   const DEBUG = true;
@@ -113,10 +117,138 @@ exports.postAceInit = (hook, context) => {
 
       inlineImages(cleanedHtml).then((finalHtml) => {
         context.ace.callWithAce((ace) => {
-          ace.ace_inCallStackIfNecessary('docxPaste', () => {
-            const innerWin = $innerIframe[0].contentWindow;
-            innerWin.document.execCommand('insertHTML', false, finalHtml);
-          });
+          // Determine whether caret is inside an ep_tables5 table cell
+          let insideTableCell = false;
+          try {
+            const rep = ace.ace_getRep && ace.ace_getRep();
+            const docMgr = ace.documentAttributeManager || ace.editorInfo?.documentAttributeManager;
+            if (rep && rep.selStart && docMgr && docMgr.getAttributeOnLine) {
+              const lineNum = rep.selStart[0];
+              const attr = docMgr.getAttributeOnLine(lineNum, ATTR_TABLE_JSON);
+              if (attr) insideTableCell = true;
+            }
+          } catch (_) {/* ignore */}
+
+          // Fallback DOM-based detection (for block-styled rows)
+          if (!insideTableCell) {
+            try {
+              const innerWin = $innerIframe[0].contentWindow;
+              const sel = innerWin.getSelection && innerWin.getSelection();
+              if (sel && sel.rangeCount) {
+                let n = sel.getRangeAt(0).startContainer;
+                while (n) {
+                  if (n.nodeType === 1 && n.matches && n.matches('table.dataTable')) { insideTableCell = true; break; }
+                  n = n.parentNode;
+                }
+              }
+            } catch (_) {/* ignore */}
+          }
+
+          // NEW: Ensure the paste selection is fully inside a single cell. Abort if it spans multiple cells/rows.
+          if (insideTableCell) {
+            if (DEBUG) console.log('[docx_customizer] insideTableCell confirmed – using safe PLAINTEXT insertion');
+
+            try {
+              const repNow = ace.ace_getRep();
+              if (!repNow || !repNow.selStart) {
+                console.warn('[docx_customizer] rep missing at paste-time, aborting plain-text insert');
+                return;
+              }
+
+              // Validate that selection is within the current cell (same logic as before)
+              const selStart = repNow.selStart.slice();
+              const selEnd   = repNow.selEnd.slice();
+              const lineNum  = selStart[0];
+
+              const lineText = repNow.lines.atIndex(lineNum)?.text || '';
+              const cells    = lineText.split(DELIMITER);
+              const docMgrPre = ace.documentAttributeManager || ace.editorInfo?.documentAttributeManager;
+              const attrStrBefore = docMgrPre?.getAttributeOnLine ? docMgrPre.getAttributeOnLine(lineNum, ATTR_TABLE_JSON) : null;
+              let tableMetaBefore = null;
+              try { if (attrStrBefore) tableMetaBefore = JSON.parse(attrStrBefore); } catch {}
+              let currentOffset = 0;
+              let targetCellIndex = -1;
+              let cellEndCol = 0;
+              for (let i = 0; i < cells.length; i++) {
+                const cellLength = cells[i]?.length ?? 0;
+                const cellEndThis = currentOffset + cellLength;
+                if (selStart[1] >= currentOffset && selStart[1] <= cellEndThis) {
+                  targetCellIndex = i;
+                  cellEndCol   = cellEndThis;
+                  break;
+                }
+                currentOffset += cellLength + DELIMITER.length;
+              }
+
+              if (targetCellIndex === -1 || selEnd[1] > cellEndCol) {
+                console.warn('[docx_customizer] selection extends outside target cell – abort');
+                return;
+              }
+
+              // --- Convert HTML to plain text (strip tags) ---
+              const tmp = document.createElement('div');
+              tmp.innerHTML = finalHtml;
+              let plainText = tmp.textContent || tmp.innerText || '';
+
+              // Sanitize similar to ep_tables5
+              plainText = plainText
+                .replace(/(\r\n|\n|\r)/gm, ' ')
+                .replace(new RegExp(DELIMITER, 'g'), ' ') // Strip delimiter char
+                .replace(/\t/g, ' ') // Tabs to space
+                .replace(/\s+/g, ' ') // Collapse whitespace
+                .trim();
+
+              if (!plainText) {
+                if (DEBUG) console.log('[docx_customizer] Plaintext empty after sanitization – abort paste');
+                return;
+              }
+
+              // Length cap same as tables plugin
+              const currentCellText = cells[targetCellIndex] || '';
+              const selectionLength = selEnd[1] - selStart[1];
+              const MAX_CELL_LENGTH = 8000;
+              const newCellLength = currentCellText.length - selectionLength + plainText.length;
+              if (newCellLength > MAX_CELL_LENGTH) {
+                plainText = plainText.substring(0, MAX_CELL_LENGTH - (currentCellText.length - selectionLength));
+              }
+
+              // Perform replacement
+              ace.ace_performDocumentReplaceRange(selStart, selEnd, plainText);
+
+              // Reapply tbljson metadata
+              if (ace.ep_tables5_applyMeta && tableMetaBefore && typeof tableMetaBefore.cols === 'number') {
+                const repAfter = ace.ace_getRep();
+                const docMgrSafe = docMgrPre;
+                ace.ep_tables5_applyMeta(
+                  lineNum,
+                  tableMetaBefore.tblId,
+                  tableMetaBefore.row,
+                  tableMetaBefore.cols,
+                  repAfter,
+                  ace,
+                  null,
+                  docMgrSafe,
+                );
+              }
+
+              // Move caret to end of inserted text
+              const newCaretCol = selStart[1] + plainText.length;
+              ace.ace_performSelectionChange([lineNum, newCaretCol], [lineNum, newCaretCol], false);
+
+              ace.ace_fastIncorp && ace.ace_fastIncorp(10);
+
+              if (DEBUG) console.log('[docx_customizer] Plain-text table-cell paste completed');
+
+            } catch (errPaste) {
+              console.error('[docx_customizer] error during plain-text table paste', errPaste);
+            }
+          } else {
+            // Normal (non-table) insertion – keep HTML & formatting
+            ace.ace_inCallStackIfNecessary('docxPaste', () => {
+              const innerWin = $innerIframe[0].contentWindow;
+              innerWin.document.execCommand('insertHTML', false, finalHtml);
+            });
+          }
         }, 'docxPaste', true);
       });
 
