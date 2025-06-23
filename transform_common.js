@@ -62,6 +62,73 @@ const enc = (s) => {
 const DELIMITER = '\u241F';
 const ZWSP = '\u200B';
 
+/**
+ * Upload an image to S3 using the existing ep_images_extended endpoint (browser environment)
+ * @param {Blob} blob - The image blob
+ * @param {string} filename - The filename to use
+ * @param {string} padId - The pad ID
+ * @returns {Promise<string|null>} - The public URL or null if failed
+ */
+async function uploadImageToS3Browser(blob, filename, padId) {
+  try {
+    // Check if we're in browser environment and S3 is configured
+    if (typeof window === 'undefined') {
+      throw new Error('Not in browser environment');
+    }
+    
+    if (typeof clientVars === 'undefined') {
+      throw new Error('clientVars not available');
+    }
+    
+    console.log('[transform_common] clientVars.ep_images_extended:', clientVars.ep_images_extended);
+    
+    if (!clientVars.ep_images_extended) {
+      throw new Error('ep_images_extended not configured in clientVars');
+    }
+    
+    if (clientVars.ep_images_extended.storageType !== 's3_presigned') {
+      throw new Error(`Storage type is "${clientVars.ep_images_extended.storageType}", expected "s3_presigned"`);
+    }
+
+    // Get presigned URL from ep_images_extended
+    const queryParams = new URLSearchParams({ name: filename, type: blob.type });
+    const basePath = window.location.pathname.split('/p/')[0] || '';
+    const presignUrl = `${basePath}/p/${padId}/pluginfw/ep_images_extended/s3_presign?${queryParams}`;
+    
+    console.log('[transform_common] requesting presign URL:', presignUrl);
+    console.log('[transform_common] parameters:', { name: filename, type: blob.type, padId });
+    
+    const presignResp = await fetch(presignUrl);
+
+    if (!presignResp.ok) {
+      const errorText = await presignResp.text();
+      console.error('[transform_common] presign error response:', errorText);
+      throw new Error(`Presign request failed: ${presignResp.status} - ${errorText}`);
+    }
+
+    const presignData = await presignResp.json();
+    if (!presignData.signedUrl || !presignData.publicUrl) {
+      throw new Error('Invalid presign response');
+    }
+
+    // Upload to S3
+    const uploadResp = await fetch(presignData.signedUrl, {
+      method: 'PUT',
+      headers: { 'Content-Type': blob.type },
+      body: blob,
+    });
+
+    if (!uploadResp.ok) {
+      throw new Error(`S3 upload failed: ${uploadResp.status}`);
+    }
+
+    return presignData.publicUrl;
+  } catch (error) {
+    console.warn('[transform_common] S3 upload failed:', error);
+    return null;
+  }
+}
+
 function customizeDocument(document, options = {}) {
   let modified = false;
 
@@ -378,4 +445,4 @@ function customizeDocument(document, options = {}) {
   return modified;
 }
 
-module.exports = {customizeDocument, DELIMITER, ZWSP}; 
+module.exports = {customizeDocument, uploadImageToS3Browser, DELIMITER, ZWSP}; 

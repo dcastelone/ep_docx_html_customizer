@@ -1,5 +1,38 @@
 'use strict';
 
+/**
+ * ep_docx_html_customizer with S3 Integration
+ * 
+ * This plugin now supports S3 image uploads during both document import and clipboard paste operations.
+ * It reuses the existing ep_images_extended S3 infrastructure to avoid code duplication.
+ * 
+ * Configuration (in settings.json):
+ * 
+ * {
+ *   "ep_images_extended": {
+ *     "storage": {
+ *       "type": "s3_presigned",
+ *       "region": "us-east-1",
+ *       "bucket": "your-bucket-name",
+ *       "publicURL": "https://your-cdn.com/",
+ *       "expires": 900
+ *     },
+ *     "fileTypes": ["png", "jpg", "jpeg", "webp", "gif"],
+ *     "maxFileSize": 10485760
+ *   }
+ * }
+ * 
+ * Required environment variables:
+ * - AWS_ACCESS_KEY_ID
+ * - AWS_SECRET_ACCESS_KEY
+ * - AWS_SESSION_TOKEN (if using temporary credentials)
+ * 
+ * This plugin will:
+ * 1. During DOCX/DOC/ODT import: Upload relative images to S3 (REQUIRED - no fallback)
+ * 2. During clipboard paste: Upload remote images to S3 (REQUIRED - no fallback)
+ * 3. If S3 is not configured or fails: Images will be skipped/rejected
+ */
+
 const fs = require('fs');
 const fsp = fs.promises;
 const path = require('path');
@@ -11,11 +44,93 @@ const settings = require('ep_etherpad-lite/node/utils/Settings');
 const util = require('util');
 const execPromise = util.promisify(exec);
 const mime = require('mime');
+const { randomUUID } = require('crypto');
+const url = require('url');
+
+// AWS SDK v3 for S3 uploads (optional - only needed for server-side S3 uploads during import)
+let S3Client, PutObjectCommand, getSignedUrl;
+try {
+  ({ S3Client, PutObjectCommand } = require('@aws-sdk/client-s3'));
+  ({ getSignedUrl } = require('@aws-sdk/s3-request-presigner'));
+} catch (e) {
+  // AWS SDK might be optional if s3_presigned storage is not used
+  logger.warn('[ep_docx_html_customizer] AWS SDK not installed; S3 upload will not work.');
+}
 
 const logger = log4js.getLogger('ep_docx_html_customizer');
 
 // Helper for stable random ids
 const rand = () => Math.random().toString(36).slice(2, 8);
+
+/**
+ * Upload an image to S3 using the existing ep_images_extended presign endpoint
+ * This function is used during the import process to upload relative images to S3
+ * 
+ * @param {Buffer} imageBuffer - The image data as a buffer
+ * @param {string} mimeType - The MIME type of the image
+ * @param {string} originalPath - The original file path (used for extension)
+ * @param {string} padId - The pad ID for organizing uploads
+ * @returns {Promise<string|null>} - The public URL of the uploaded image, or null if upload failed
+ */
+async function uploadImageToS3(imageBuffer, mimeType, originalPath, padId = 'import') {
+  try {
+    // Check if S3 storage is configured
+    const storageCfg = settings.ep_images_extended && settings.ep_images_extended.storage;
+    if (!storageCfg || storageCfg.type !== 's3_presigned') {
+      logger.error('[ep_docx_html_customizer] S3 storage not configured - ep_images_extended.storage.type must be "s3_presigned"');
+      return null;
+    }
+
+    if (!S3Client || !PutObjectCommand || !getSignedUrl) {
+      logger.error('[ep_docx_html_customizer] AWS SDK not available for server-side S3 upload');
+      return null;
+    }
+
+    const { bucket, region, publicURL, expires } = storageCfg;
+    if (!bucket || !region) {
+      logger.error('[ep_docx_html_customizer] Invalid S3 configuration - missing bucket or region');
+      return null;
+    }
+
+    // Determine file extension and create a unique filename
+    const ext = path.extname(originalPath) || '.png';
+    const safeExt = ext.startsWith('.') ? ext : `.${ext}`;
+    const key = `${padId}/${randomUUID()}${safeExt}`;
+
+    // Create S3 client and generate presigned URL
+    const s3Client = new S3Client({ region });
+    const putCommand = new PutObjectCommand({
+      Bucket: bucket,
+      Key: key,
+      ContentType: mimeType,
+    });
+
+    const signedUrl = await getSignedUrl(s3Client, putCommand, { expiresIn: expires || 600 });
+
+    // Upload the image directly to S3 using the presigned URL
+    const fetch = (await import('node-fetch')).default;
+    const uploadResp = await fetch(signedUrl, {
+      method: 'PUT',
+      headers: { 'Content-Type': mimeType },
+      body: imageBuffer,
+    });
+
+    if (!uploadResp.ok) {
+      throw new Error(`S3 upload failed with status ${uploadResp.status}`);
+    }
+
+    // Generate the public URL
+    const basePublic = publicURL || `https://${bucket}.s3.${region}.amazonaws.com/`;
+    const publicUrl = new url.URL(key, basePublic).toString();
+
+    logger.info(`[ep_docx_html_customizer] Successfully uploaded image to S3: ${publicUrl}`);
+    return publicUrl;
+
+  } catch (error) {
+    logger.warn(`[ep_docx_html_customizer] Failed to upload image to S3: ${error.message}`);
+    return null;
+  }
+}
 
 // encode/decode so JSON can survive as a CSS class token if ever needed
 const enc = (s) => {
@@ -289,8 +404,19 @@ exports.import = async (hookName, context) => {
           if (fs.existsSync(imagePath)) {
             const imageBuffer = await fsp.readFile(imagePath);
             const mimeType = mime.getType(imagePath) || 'application/octet-stream';
-            imgSrc = `data:${mimeType};base64,${imageBuffer.toString('base64')}`;
-            logger.debug(`[ep_docx_html_customizer] Converted HTML - Image ${index + 1} successfully converted to data URI.`);
+            
+            // Try to upload to S3 - error out if it fails
+            const padId = context.padId || 'import';
+            const s3Url = await uploadImageToS3(imageBuffer, mimeType, imagePath, padId);
+            
+            if (s3Url) {
+              imgSrc = s3Url;
+              logger.debug(`[ep_docx_html_customizer] Converted HTML - Image ${index + 1} successfully uploaded to S3: ${s3Url}`);
+            } else {
+              // Error out if S3 upload fails - no data URI fallback
+              logger.error(`[ep_docx_html_customizer] Converted HTML - Image ${index + 1} S3 upload failed for ${imagePath}. Skipping image.`);
+              continue;
+            }
           } else {
             logger.warn(`[ep_docx_html_customizer] Converted HTML - Image ${index + 1} relative path not found: ${imagePath}.`);
             continue;
@@ -735,6 +861,17 @@ const _getFetch = () => {
  * This endpoint streams remote images back to the browser with permissive
  * CORS headers so that client-side code can convert them into data URIs.
  */
+// Add client-side assets for toast notifications
+exports.eejsBlock_styles = (hookName, args, cb) => {
+  args.content += '<link href="../static/plugins/ep_docx_html_customizer/static/css/toast.css" rel="stylesheet">';
+  return cb();
+};
+
+exports.eejsBlock_body = (hookName, args, cb) => {
+  args.content += '<script src="../static/plugins/ep_docx_html_customizer/static/js/toast.js"></script>';
+  return cb();
+};
+
 exports.expressCreateServer = (hookName, {app}) => {
   console.log('[docx_customizer] expressCreateServer – setting up /ep_docx_image_proxy');
   logger.info('[ep_docx_html_customizer] expressCreateServer hook: registering /ep_docx_image_proxy route');
@@ -756,11 +893,23 @@ exports.expressCreateServer = (hookName, {app}) => {
   };
 
   app.get('/ep_docx_image_proxy', async (req, res) => {
-    // Require Etherpad session (authenticated user or guest author).
-    if (!req.session || (!req.session.user && !req.session.authorId)) {
+    // Accept either a valid Express session ("express_sid") *or* the normal
+    // Etherpad cookies that are present when a pad is open in the browser
+    // ("sessionID" from the HTTP API login flow or the author "token").
+    // Some browsers block third-party cookies and therefore strip the
+    // HttpOnly "express_sid" cookie when Etherpad is embedded in an iframe.
+    // Falling back to the non-HttpOnly Etherpad cookies prevents spurious
+    // 401 errors while still ensuring that only authenticated pad users can
+    // use the proxy.
+
+    const hasExpressSession = req.session && (req.session.user || req.session.authorId);
+    const hasPadCookie = req.cookies && (req.cookies.sessionID || req.cookies.token);
+
+    if (!hasExpressSession && !hasPadCookie) {
       res.status(401).send('Authentication required');
       return;
     }
+
     const url = req.query.url;
     if (!url || !/^https?:\/\//i.test(url)) {
       res.status(400).send('Bad url');
