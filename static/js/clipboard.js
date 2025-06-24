@@ -9,6 +9,7 @@ const {customizeDocument, uploadImageToS3Browser} = require('../../transform_com
 // ADD: Constants matching ep_tables5 for table detection & delimiter cleanup
 const ATTR_TABLE_JSON = 'tbljson';
 const DELIMITER = '\u241F'; // same invisible delimiter used by ep_tables5
+const ATTR_CELL = 'td';
 
 exports.postAceInit = (hook, context) => {
   console.log('[docx_customizer] postAceInit invoked – clipboard customization ready');
@@ -211,9 +212,13 @@ exports.postAceInit = (hook, context) => {
               });
               if (dim && dim.w && dim.h) {
                 const ratio = (dim.w / dim.h).toFixed(4);
-                sp.classList.add(`image-width:${dim.w}px`);
-                sp.classList.add(`image-height:${dim.h}px`);
-                sp.classList.add(`imageCssAspectRatio:${ratio}`);
+                const hasWidthCls  = Array.from(sp.classList).some(c => c.startsWith('image-width:'));
+                const hasHeightCls = Array.from(sp.classList).some(c => c.startsWith('image-height:'));
+                const hasRatioCls  = Array.from(sp.classList).some(c => c.startsWith('imageCssAspectRatio:'));
+
+                if (!hasWidthCls)  sp.classList.add(`image-width:${dim.w}px`);
+                if (!hasHeightCls) sp.classList.add(`image-height:${dim.h}px`);
+                if (!hasRatioCls)  sp.classList.add(`imageCssAspectRatio:${ratio}`);
               }
             } catch (_) { /* ignore failures */ }
             
@@ -441,9 +446,14 @@ exports.postAceInit = (hook, context) => {
                 // Conditional leading space (same as hyperlinked plugin)
                 if (segIdx > 0) {
                   const previousSegment = cleanedSegments[segIdx - 1];
-                  if (previousSegment.text.length > 0 && textToInsert.length > 0 && !/\s$/.test(previousSegment.text) && !/^\s/.test(textToInsert)) {
-                    if (DEBUG) console.log(`[docx_customizer] seg${segIdx}: inserting leading space at L${currentLine}C${currentCol}`);
-                    ace.ace_performDocumentReplaceRange([currentLine, currentCol], [currentLine, currentCol], ' ');
+                  /* Insert a literal space only when BOTH neighbouring segments are plain text.
+                     Image placeholders must keep their exact ZWSP-…-ZWSP pattern or ep_images_extended
+                     cannot detect them for resize/float handling. */
+                  if (!segment.isImage && !previousSegment.isImage &&
+                      previousSegment.text.length > 0 && textToInsert.length > 0 &&
+                      !/\s$/.test(previousSegment.text) && !/^\s/.test(textToInsert)) {
+                      ace.ace_performDocumentReplaceRange([currentLine, currentCol],
+                                                          [currentLine, currentCol], ' ');
                     const repAfterSpace = ace.ace_getRep();
                     currentLine = repAfterSpace.selEnd[0];
                     currentCol  = repAfterSpace.selEnd[1];
@@ -478,8 +488,12 @@ exports.postAceInit = (hook, context) => {
                       const classes = (segment.imageClasses || '').split(' ');
                       const imageAttrs = [];
                       
-                      // Add the main image URL
-                      imageAttrs.push(['image', segment.imageUrl]);
+                      // Add the main image URL – ensure it is percent-encoded so the resulting
+                      // `image:` class contains a valid CSS identifier.  This matters especially
+                      // for images pasted into ep_tables5 cells where the URL was previously left
+                      // unencoded ("image:https://…") and therefore broke resize handling.
+                      const encodedUrl = encodeURIComponent(segment.imageUrl);
+                      imageAttrs.push(['image', encodedUrl]);
                       
                       // Extract other image attributes from classes
                       for (const cls of classes) {
@@ -544,8 +558,63 @@ exports.postAceInit = (hook, context) => {
           } else {
             // Normal (non-table) insertion – keep HTML & formatting
             ace.ace_inCallStackIfNecessary('docxPaste', () => {
+              // 1) Let the browser paste the HTML so spans with tbljson-* classes
+              //    land in the DOM and Ace converts them into atext.
               const innerWin = $innerIframe[0].contentWindow;
               innerWin.document.execCommand('insertHTML', false, finalHtml);
+
+              // 2) Sync to Ace's internal document model.
+              ace.ace_fastIncorp && ace.ace_fastIncorp(10);
+
+              const rep     = ace.ace_getRep();
+              const docMgr  = ace.documentAttributeManager || ace.editorInfo?.documentAttributeManager;
+              if (!rep || !docMgr) return;
+
+              // Determine a conservative line range that likely contains the newly
+              // inserted block – from the first line of the current selection to
+              // the current end of the document.
+              const firstLine = (rep.selStart && Array.isArray(rep.selStart)) ? rep.selStart[0] : 0;
+              const lastLine  = rep.lines.length() - 1;
+
+              for (let ln = firstLine; ln <= lastLine; ln++) {
+                const attrStr = docMgr.getAttributeOnLine(ln, ATTR_TABLE_JSON);
+                if (!attrStr) continue; // not a table row
+
+                let meta;
+                try { meta = JSON.parse(attrStr); } catch (_) {/* ignore */}
+
+                const lineText = rep.lines.atIndex(ln).text || '';
+                const cells    = lineText.split(DELIMITER);
+
+                // 3) Apply the per-cell td attribute so Etherpad produces author spans.
+                let offset = 0;
+                cells.forEach((cellTxt, idx) => {
+                  if (cellTxt.length > 0) {
+                    ace.ace_performDocumentApplyAttributesToRange(
+                      [ln, offset], [ln, offset + cellTxt.length], [[ATTR_CELL, String(idx)]]);
+                  }
+                  offset += cellTxt.length;
+                  if (idx < cells.length - 1) offset += DELIMITER.length;
+                });
+
+                // 4) Re-assert tbljson line attribute via official helper to make
+                //    sure column-width metadata is stored.
+                if (ace.ep_tables5_applyMeta && meta && typeof meta.cols === 'number') {
+                  ace.ep_tables5_applyMeta(
+                    ln,
+                    meta.tblId,
+                    meta.row,
+                    meta.cols,
+                    rep,
+                    ace,
+                    null,
+                    docMgr,
+                  );
+                }
+              }
+
+              // Final sync so the attribute changes are flushed.
+              ace.ace_fastIncorp && ace.ace_fastIncorp(10);
             });
           }
         }, 'docxPaste', true);

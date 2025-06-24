@@ -214,6 +214,31 @@ function customizeDocument(document, options = {}) {
   });
 
   /* ───────────── Images ───────────── */
+  const cssImageSizeMap = {};
+  try {
+    document.querySelectorAll('style').forEach((styleNode) => {
+      const cssText = styleNode.textContent || '';
+      cssText.split('}').forEach((rule) => {
+        const m = rule.match(/\.([^,{\s]+)\s*\{([^}]*)/); // .classname { ... }
+        if (!m) return;
+        const cls = m[1].trim();
+        const decls = m[2] || '';
+        const wMatch = /width\s*:\s*([^;]+)/i.exec(decls);
+        const hMatch = /height\s*:\s*([^;]+)/i.exec(decls);
+        if (wMatch || hMatch) {
+          cssImageSizeMap[cls] = {
+            w: wMatch ? wMatch[1].trim() : null,
+            h: hMatch ? hMatch[1].trim() : null,
+          };
+        }
+      });
+    });
+  } catch (e) { /* swallow but log */ console.warn('[transform_common] CSS parse error', e); }
+
+  if (typeof console !== 'undefined' && console.debug) {
+    console.debug('[transform_common] cssImageSizeMap keys', Object.keys(cssImageSizeMap).length);
+  }
+
   const images = document.querySelectorAll('img');
   images.forEach((img) => {
     let src = img.getAttribute('src');
@@ -237,6 +262,58 @@ function customizeDocument(document, options = {}) {
     outerSpan.textContent = ZWSP;
     let classes = 'inline-image character image-placeholder';
     classes += ` image:${encodeURIComponent(src)}`;
+
+    // Preserve explicit width/height from the source HTML so that ep_images_extended can
+    // recreate the original size immediately after the paste (even before remote inlining
+    // occurs).  This mirrors the logic already present in the server-side import path
+    // (index.js) so both clipboard and document import behave identically.
+
+    let imgWidthAttr  = img.getAttribute('width')  || (img.style && img.style.width)  || '';
+    let imgHeightAttr = img.getAttribute('height') || (img.style && img.style.height) || '';
+
+    if (typeof console !== 'undefined' && console.debug) {
+      console.debug('[transform_common] <img> initial dims', {src, width: imgWidthAttr, height: imgHeightAttr, classList: img.className});
+    }
+
+    // Fallback to CSS rule–declared sizes if direct attrs missing
+    if (!imgWidthAttr || !imgHeightAttr) {
+      const classesImg = (img.className || '').split(/\s+/).filter(Boolean);
+      for (const c of classesImg) {
+        const entry = cssImageSizeMap[c];
+        if (entry) {
+          if (!imgWidthAttr && entry.w)  imgWidthAttr  = entry.w;
+          if (!imgHeightAttr && entry.h) imgHeightAttr = entry.h;
+          if (typeof console !== 'undefined' && console.debug) {
+            console.debug('[transform_common] CSS fallback found', {cls: c, w: entry.w, h: entry.h});
+          }
+          if (imgWidthAttr && imgHeightAttr) break;
+        }
+      }
+    }
+
+    // Helper: returns a pixel value string with "px" suffix when the input is a plain number.
+    const _normaliseDim = (val) => {
+      if (!val) return null;
+      const trimmed = String(val).trim();
+      // Accept formats like "123", "123px", "123.4", "123.4px" (case-insensitive)
+      const m = /^([0-9]+(?:\.[0-9]+)?)(px)?$/i.exec(trimmed);
+      if (m) return `${m[1]}px`;
+      return trimmed; // keep original (e.g. "%", "pt", etc.)
+    };
+
+    const imgWidthPx  = _normaliseDim(imgWidthAttr);
+    const imgHeightPx = _normaliseDim(imgHeightAttr);
+
+    if (imgWidthPx)  classes += ` image-width:${imgWidthPx}`;
+    if (imgHeightPx) classes += ` image-height:${imgHeightPx}`;
+
+    // Add CSS aspect ratio helper if both dimensions are numeric.
+    const numW = parseFloat(imgWidthPx);
+    const numH = parseFloat(imgHeightPx);
+    if (!isNaN(numW) && numW > 0 && !isNaN(numH) && numH > 0) {
+      classes += ` imageCssAspectRatio:${(numW / numH).toFixed(4)}`;
+    }
+
     const imageId = rand() + rand();
     classes += ` image-id-${imageId}`;
     outerSpan.setAttribute('data-image-id', imageId);
@@ -247,6 +324,10 @@ function customizeDocument(document, options = {}) {
     frag.appendChild(document.createTextNode(ZWSP));
     img.parentNode.replaceChild(frag, img);
     modified = true;
+
+    if (typeof console !== 'undefined' && console.debug) {
+      console.debug('[transform_common] <img> final dims to encode', {width: imgWidthAttr, height: imgHeightAttr});
+    }
   });
 
   /* ───────────── Hyperlinks ───────────── */
@@ -409,9 +490,21 @@ function customizeDocument(document, options = {}) {
           };
 
           html = flatten(tmp);
-          if (/^<br\/?>(\s*)?$/.test(html)) html = '';
+          if (/^<br\/?>(\s*)?$/i.test(html)) html = '';
           if (html) html = html.replace(/(<br\s*\/?>\s*)+$/gi, '').replace(/<br\s*\/?>/gi, ' ').trim();
-          if (!html) html = ' <span>&nbsp;</span>';
+
+          // Detect cells that are visibly empty (may contain only &nbsp;/whitespace)
+          let visiblyEmpty = false;
+          if (!html) {
+            visiblyEmpty = true;
+          } else {
+            const probeDiv = document.createElement('div');
+            probeDiv.innerHTML = html;
+            const txt = (probeDiv.textContent || '').replace(/\u00A0/g, '').trim();
+            visiblyEmpty = txt === '';
+          }
+
+          if (visiblyEmpty) html = ' <span>&nbsp;</span>';
 
           cellTexts[col] = html;
 
