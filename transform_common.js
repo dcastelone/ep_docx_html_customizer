@@ -129,6 +129,49 @@ async function uploadImageToS3Browser(blob, filename, padId) {
   }
 }
 
+// Add a helper that performs a CORS fetch with automatic same-origin proxy fallback.
+// It mirrors the logic previously duplicated in clipboard.js so other plugins (for
+// example ep_images_extended) can reuse it without copy-pasting.
+async function fetchWithCorsProxy(url, opts = {}) {
+  const timeoutMs = opts.timeoutMs || 10000;
+  const controller = (typeof AbortController === 'function') ? new AbortController() : null;
+  const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+
+  const tryFetch = async (fetchUrl) => {
+    const resp = await fetch(fetchUrl, controller ? { signal: controller.signal } : {});
+    if (resp.ok) return resp;
+    throw new Error(`status ${resp.status}`);
+  };
+
+  try {
+    // First attempt: regular CORS request.
+    return await tryFetch(url);
+  } catch (e) {
+    // Fall back to the same-origin proxy that ep_docx_html_customizer registers.
+    const basePath = (typeof window !== 'undefined') ? (window.location.pathname.split('/p/')[0] || '') : '';
+    const origin   = (typeof window !== 'undefined') ? window.location.origin : '';
+    const candidateUrls = [
+      `${basePath}/ep_docx_image_proxy?url=${encodeURIComponent(url)}`,
+      `/ep_docx_image_proxy?url=${encodeURIComponent(url)}`,
+      `${origin}${basePath}/ep_docx_image_proxy?url=${encodeURIComponent(url)}`,
+    ];
+    for (const proxy of candidateUrls) {
+      try {
+        return await tryFetch(proxy);
+      } catch (_) { /* keep trying */ }
+    }
+    throw e; // Nothing worked – propagate original error
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+// Expose globally so that other plugins (e.g. ep_images_extended) can use it without
+// complex cross-plugin require paths.
+if (typeof window !== 'undefined' && typeof window.fetchWithCorsProxy !== 'function') {
+  window.fetchWithCorsProxy = fetchWithCorsProxy;
+}
+
 function customizeDocument(document, options = {}) {
   let modified = false;
 
@@ -572,4 +615,4 @@ function customizeDocument(document, options = {}) {
   return modified;
 }
 
-module.exports = {customizeDocument, uploadImageToS3Browser, DELIMITER, ZWSP}; 
+module.exports = {customizeDocument, uploadImageToS3Browser, DELIMITER, ZWSP, fetchWithCorsProxy}; 
