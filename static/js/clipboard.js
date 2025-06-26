@@ -10,200 +10,112 @@ const {customizeDocument, uploadImageToS3Browser} = require('../../transform_com
 const ATTR_TABLE_JSON = 'tbljson';
 const DELIMITER = '\u241F'; // same invisible delimiter used by ep_tables5
 const ATTR_CELL = 'td';
+const DEBUG = true;
+
+// Base64 decode helper (URL-safe) reused by table logic
+const dec = (s) => {
+  try {
+    return atob(s.replace(/-/g, '+').replace(/_/g, '/'));
+  } catch (e) {
+    if (DEBUG) console.error('[docx_customizer] Base64 decode failed', s, e);
+    return null;
+  }
+};
+
+// Base64 encode helper (URL-safe) reused by table logic
+const enc = (s) => {
+  if (typeof btoa === 'function') {
+    return btoa(s).replace(/\+/g, '-').replace(/_/g, '_');
+  } else if (typeof Buffer === 'function') {
+    return Buffer.from(s).toString('base64').replace(/\+/g, '-').replace(/_/g, '_');
+  }
+  return s;
+};
 
 exports.postAceInit = (hook, context) => {
-  console.log('[docx_customizer] postAceInit invoked – clipboard customization ready');
-  const DEBUG = true;
-
-  // Defer until ace_inner iframe is available, same pattern as hyperlinked_text
+  if (DEBUG) console.log('[docx_customizer] postAceInit invoked');
   context.ace.callWithAce(() => {
     const $innerIframe = $('iframe[name="ace_outer"]').contents().find('iframe[name="ace_inner"]');
-    if (!$innerIframe.length) {
-      if (DEBUG) console.warn('[docx_customizer] inner iframe not found at postAceInit');
-      return;
-    }
-    if (DEBUG) console.log('[docx_customizer] inner iframe located');
-
+    if (!$innerIframe.length) return;
     const $innerBody = $innerIframe.contents().find('body');
-    if (!$innerBody.length) {
-      if (DEBUG) console.warn('[docx_customizer] inner body not found inside iframe');
-      return;
-    }
-
-    if (DEBUG) console.log('[docx_customizer] attaching paste listener');
+    if (!$innerBody.length) return;
 
     $innerBody.on('paste', (evt) => {
       const clipboardData = evt.originalEvent.clipboardData;
-      if (DEBUG) console.log('[docx_customizer] paste event captured');
-      if (!clipboardData) {
-        if (DEBUG) console.log('[docx_customizer] no clipboardData');
-        return;
-      }
-      
-      // Check if this is just raw image data - let ep_images_extended handle it
-      const hasImageFiles = clipboardData.types.includes('Files') && clipboardData.files && clipboardData.files.length > 0;
-      const hasHTML = clipboardData.types.includes('text/html');
-      
-      if (hasImageFiles && !hasHTML) {
-        if (DEBUG) console.log('[docx_customizer] clipboard contains only image files, letting ep_images_extended handle it');
-        return; // Let ep_images_extended handle raw image pastes
-      }
-      
-      if (!hasHTML) {
-        if (DEBUG) console.log('[docx_customizer] no HTML content, letting core handle plain text');
-        return; // let core handle plain text
-      }
-
+      if (!clipboardData || !clipboardData.types.includes('text/html')) return;
       const html = clipboardData.getData('text/html');
-      if (!html) {
-        if (DEBUG) console.log('[docx_customizer] clipboard has no HTML data');
-        return;
-      }
+      if (!html) return;
 
-      // Check if the HTML content actually needs our transformations
-      // If it's just a simple image or doesn't contain our target elements, let other plugins handle it
-      const tempDiv = document.createElement('div');
-      tempDiv.innerHTML = html;
-      
-      const needsTransformation = (
-        tempDiv.querySelector('h1, h2, h3, h4, h5, h6') ||          // headings
-        tempDiv.querySelector('[style*="text-align"], [align]') ||   // alignment
-        tempDiv.querySelector('ol') ||                               // ordered lists
-        tempDiv.querySelector('a[href]') ||                          // hyperlinks
-        tempDiv.querySelector('table') ||                            // tables
-        tempDiv.querySelector('[style*="color"], font[color], [style*="font-size"]') || // styling
-        (tempDiv.querySelector('img') && tempDiv.textContent.trim()) // images with text content
-      );
-      
-      if (!needsTransformation) {
-        if (DEBUG) console.log('[docx_customizer] HTML content does not need our transformations, skipping');
-        return;
-      }
-
-      if (DEBUG) console.log('[docx_customizer] transforming HTML');
+      if (DEBUG) console.log('[docx_customizer] paste event captured with HTML');
       evt.preventDefault();
       evt.stopImmediatePropagation();
 
-      // Transform clipboard HTML
       const doc = new DOMParser().parseFromString(html, 'text/html');
       customizeDocument(doc, {env: 'browser'});
       const cleanedHtml = doc.body.innerHTML;
-
       if (DEBUG) console.log('[docx_customizer] cleanedHtml length', cleanedHtml.length);
 
-      // Inline remote images with S3 upload or data URI fallback
       const inlineImages = async (html) => {
         const tmp = document.createElement('div');
         tmp.innerHTML = html;
         const spans = tmp.querySelectorAll('span[class*="image:"]');
-        
-        // Show progress toast if there are images to process
         const imageSpans = Array.from(spans);
         const totalImages = imageSpans.length;
-        let processedCount = 0;
-        let successCount = 0;
-        let errorCount = 0;
-        
         if (totalImages > 0) {
           if (DEBUG) console.log(`[docx_customizer] Starting to process ${totalImages} images`);
-          if (typeof window.docxToast !== 'undefined') {
-            docxToast.showImageUploadProgress('clipboard-images', 'Processing Clipboard Images');
-            docxToast.updateImageUploadProgress('clipboard-images', 0, totalImages);
-          }
         }
-        
         await Promise.all(imageSpans.map(async (sp) => {
           const m = sp.className.match(/image:([^ ]+)/);
           if (!m) return;
           let url = decodeURIComponent(m[1]);
           if (!/^https?:/.test(url) || url.startsWith('data:')) return;
           try {
-            // First attempt direct fetch (may fail due to CORS)
             let resp;
             try {
               resp = await fetch(url, {mode: 'cors'});
               if (!resp.ok) throw new Error(`status ${resp.status}`);
             } catch (corsErr) {
-              if (DEBUG) console.warn('[docx_customizer] direct fetch failed, retry via proxy', url, corsErr);
-              
-              // Try multiple proxy URL variations to handle different deployment scenarios
-              const basePath = window.location.pathname.split('/p/')[0];
-              const proxyUrls = [
+              /*
+               * Direct CORS fetch failed – fall back to our same-origin proxy.  Depending on the
+               * deployment, Etherpad might live at a sub-path (e.g., /pad/), so try a handful of
+               * potential proxy locations before giving up.  This mirrors the robust behaviour we
+               * had in the previous plugin iteration (see temp/clipboard.js).
+               */
+              const basePath = window.location.pathname.split('/p/')[0] || '';
+              const proxyVariants = [
                 `${basePath}/ep_docx_image_proxy?url=${encodeURIComponent(url)}`,
                 `/ep_docx_image_proxy?url=${encodeURIComponent(url)}`,
-                `${window.location.origin}${basePath}/ep_docx_image_proxy?url=${encodeURIComponent(url)}`
+                `${window.location.origin}${basePath}/ep_docx_image_proxy?url=${encodeURIComponent(url)}`,
               ];
-              
-              let proxyWorked = false;
-              for (const proxyUrl of proxyUrls) {
-                if (DEBUG) console.log('[docx_customizer] trying proxy URL:', proxyUrl);
-                
+
+              let proxySuccess = false;
+              for (const proxyUrl of proxyVariants) {
                 try {
                   resp = await fetch(proxyUrl);
-                  if (DEBUG) console.log('[docx_customizer] proxy response status:', resp.status);
-                  
-                  if (resp.ok) {
-                    proxyWorked = true;
-                    break;
-                  } else {
-                    if (DEBUG) console.warn(`[docx_customizer] proxy ${proxyUrl} returned ${resp.status}: ${resp.statusText}`);
-                  }
+                  if (resp.ok) { proxySuccess = true; break; }
+                  if (DEBUG) console.warn(`[docx_customizer] proxy ${proxyUrl} returned ${resp.status}`);
                 } catch (proxyErr) {
-                  if (DEBUG) console.warn(`[docx_customizer] proxy ${proxyUrl} failed:`, proxyErr);
+                  if (DEBUG) console.warn(`[docx_customizer] proxy attempt failed ${proxyUrl}`, proxyErr);
                 }
               }
-              
-              if (!proxyWorked) {
-                throw new Error(`All fetch methods failed. Direct CORS: ${corsErr.message}, Proxy attempts all failed`);
-              }
+
+              if (!proxySuccess) throw new Error('All proxy attempts failed');
+            }
+            const blob = await resp.blob();
+              const padId = (typeof clientVars !== 'undefined') ? clientVars.padId : 'clipboard';
+            let filename = new URL(url).pathname.split('/').pop() || `image-${Date.now()}`;
+            // Ensure the filename has a proper extension recognised by ep_images_extended.
+            // Some sources (e.g. Google Drive) expose images via extension-less paths which will
+            // cause the presign endpoint to reject them (“File type not allowed”).  Derive the
+            // extension from the MIME type if missing.
+            if (!/\.[A-Za-z0-9]+$/.test(filename)) {
+              const mimeExt = (blob.type && blob.type.split('/')[1]) || 'png';
+              filename += `.${mimeExt}`;
             }
 
-            const blob = await resp.blob();
+            const finalUrl = await uploadImageToS3Browser(blob, filename, padId);
+            if (!finalUrl) throw new Error('S3 upload failed');
             
-            if (DEBUG) console.log('[docx_customizer] got blob:', blob.size, 'bytes, type:', blob.type);
-            
-            // Validate blob
-            if (!blob || blob.size === 0) {
-              throw new Error('Empty or invalid blob received from proxy');
-            }
-            
-            // Try to upload to S3 - error out if it fails
-            let finalUrl = null;
-            try {
-              // Generate a filename based on the original URL
-              const urlPath = new URL(url).pathname;
-              let filename = urlPath.split('/').pop() || `image-${Date.now()}`;
-              
-              // Ensure proper file extension
-              if (!filename.includes('.')) {
-                const ext = blob.type.split('/')[1] || 'png';
-                filename += `.${ext}`;
-              }
-              
-              if (DEBUG) console.log('[docx_customizer] uploading to S3 with filename:', filename, 'type:', blob.type);
-              
-              // Use the helper function to upload to S3
-              const padId = (typeof clientVars !== 'undefined') ? clientVars.padId : 'clipboard';
-              finalUrl = await uploadImageToS3Browser(blob, filename, padId);
-              
-              if (finalUrl && DEBUG) {
-                console.log('[docx_customizer] uploaded remote image to S3', url, '->', finalUrl);
-              } else {
-                // Error out if S3 upload fails - no data URI fallback
-                throw new Error('S3 upload returned null - upload failed or not configured');
-              }
-            } catch (s3Err) {
-              if (DEBUG) console.error('[docx_customizer] S3 upload failed, skipping image', url, s3Err);
-              errorCount++;
-              processedCount++;
-              if (totalImages > 0 && typeof window.docxToast !== 'undefined') {
-                docxToast.updateImageUploadProgress('clipboard-images', processedCount, totalImages);
-              }
-              return; // Skip this image entirely
-            }
-            
-            // Determine intrinsic size to add width/height classes for correct aspect ratio
-            try {
               const dim = await new Promise((res, rej) => {
                 const imgObj = new Image();
                 imgObj.onload = () => res({w: imgObj.naturalWidth, h: imgObj.naturalHeight});
@@ -220,55 +132,25 @@ exports.postAceInit = (hook, context) => {
                 if (!hasHeightCls) sp.classList.add(`image-height:${dim.h}px`);
                 if (!hasRatioCls)  sp.classList.add(`imageCssAspectRatio:${ratio}`);
               }
-            } catch (_) { /* ignore failures */ }
-            
-            const encoded = encodeURIComponent(finalUrl);
-            sp.className = sp.className.replace(m[1], encoded);
-            // `customizeDocument()` already wrapped the placeholder with
-            // a single ZWSP on each side.  No extra normalisation needed.
-            
-            successCount++;
-            processedCount++;
-            if (totalImages > 0 && typeof window.docxToast !== 'undefined') {
-              docxToast.updateImageUploadProgress('clipboard-images', processedCount, totalImages);
-            }
-            
+            sp.className = sp.className.replace(m[1], encodeURIComponent(finalUrl));
           } catch (e) {
             if (DEBUG) console.warn('[docx_customizer] failed to inline', url, e);
-            errorCount++;
-            processedCount++;
-            if (totalImages > 0 && typeof window.docxToast !== 'undefined') {
-              docxToast.updateImageUploadProgress('clipboard-images', processedCount, totalImages);
-            }
           }
         }));
-        
-        // Show completion notification
-        if (totalImages > 0) {
-          if (typeof window.docxToast !== 'undefined') {
-            docxToast.completeImageUpload('clipboard-images', successCount, totalImages, errorCount);
-          }
-          if (DEBUG) console.log(`[docx_customizer] Image processing complete: ${successCount} uploaded, ${errorCount} failed`);
-        }
-        
         return tmp.innerHTML;
       };
 
       inlineImages(cleanedHtml).then((finalHtml) => {
         context.ace.callWithAce((ace) => {
-          // Determine whether caret is inside an ep_tables5 table cell
           let insideTableCell = false;
           try {
             const rep = ace.ace_getRep && ace.ace_getRep();
             const docMgr = ace.documentAttributeManager || ace.editorInfo?.documentAttributeManager;
             if (rep && rep.selStart && docMgr && docMgr.getAttributeOnLine) {
               const lineNum = rep.selStart[0];
-              const attr = docMgr.getAttributeOnLine(lineNum, ATTR_TABLE_JSON);
-              if (attr) insideTableCell = true;
+              if (docMgr.getAttributeOnLine(lineNum, ATTR_TABLE_JSON)) insideTableCell = true;
             }
-          } catch (_) {/* ignore */}
-
-          // Fallback DOM-based detection (for block-styled rows)
+          } catch (_) {}
           if (!insideTableCell) {
             try {
               const innerWin = $innerIframe[0].contentWindow;
@@ -276,353 +158,209 @@ exports.postAceInit = (hook, context) => {
               if (sel && sel.rangeCount) {
                 let n = sel.getRangeAt(0).startContainer;
                 while (n) {
-                  if (n.nodeType === 1 && n.matches && n.matches('table.dataTable')) { insideTableCell = true; break; }
+                  if (n.nodeType === 1 && n.matches && n.matches('table.dataTable')) {
+                    insideTableCell = true;
+                    break;
+                  }
                   n = n.parentNode;
                 }
               }
-            } catch (_) {/* ignore */}
+            } catch (_) {}
           }
 
-          // NEW: Ensure the paste selection is fully inside a single cell. Abort if it spans multiple cells/rows.
           if (insideTableCell) {
-            if (DEBUG) console.log('[docx_customizer] insideTableCell confirmed – using safe PLAINTEXT insertion');
-
+            if (DEBUG) console.log('[docx_customizer] insideTableCell confirmed');
             try {
               const repNow = ace.ace_getRep();
-              if (!repNow || !repNow.selStart) {
-                console.warn('[docx_customizer] rep missing at paste-time, aborting plain-text insert');
-                return;
-              }
+              if (!repNow || !repNow.selStart) return;
 
-              // Validate that selection is within the current cell (same logic as before)
               const selStart = repNow.selStart.slice();
-              let selEnd   = repNow.selEnd.slice();
-              const lineNum  = selStart[0];
-
+              const selEnd = repNow.selEnd.slice();
+              const lineNum = selStart[0];
               const lineText = repNow.lines.atIndex(lineNum)?.text || '';
-              const cells    = lineText.split(DELIMITER);
-              const docMgrPre = ace.documentAttributeManager || ace.editorInfo?.documentAttributeManager;
-              const attrStrBefore = docMgrPre?.getAttributeOnLine ? docMgrPre.getAttributeOnLine(lineNum, ATTR_TABLE_JSON) : null;
-              let tableMetaBefore = null;
-              try { if (attrStrBefore) tableMetaBefore = JSON.parse(attrStrBefore); } catch {}
+              const cells = lineText.split(DELIMITER);
               let currentOffset = 0;
-              let targetCellIndex = -1;
-              let cellEndCol = 0;
+              let targetCellIndex = -1, cellEndCol = 0;
               for (let i = 0; i < cells.length; i++) {
                 const cellLength = cells[i]?.length ?? 0;
                 const cellEndThis = currentOffset + cellLength;
                 if (selStart[1] >= currentOffset && selStart[1] <= cellEndThis) {
                   targetCellIndex = i;
-                  cellEndCol   = cellEndThis;
+                  cellEndCol = cellEndThis;
                   break;
                 }
                 currentOffset += cellLength + DELIMITER.length;
               }
+              if (targetCellIndex === -1 || selEnd[1] > cellEndCol) return;
 
-              if (targetCellIndex === -1 || selEnd[1] > cellEndCol) {
-                console.warn('[docx_customizer] selection extends outside target cell – abort');
-                return;
-              }
-
-              // === Extract hyperlink-aware segments from HTML (borrowed from ep_hyperlinked_text) ===
               const tempDivSeg = document.createElement('div');
               tempDivSeg.innerHTML = finalHtml;
-
               const segments = [];
-              const extractSegmentsRecursive = (node, inheritedUrl) => {
+              const extractSegmentsRecursive = (node, inheritedAttributes = []) => {
                 if (node.nodeType === Node.TEXT_NODE) {
-                  segments.push({text: node.textContent || '', url: inheritedUrl});
+                  segments.push({text: node.textContent || '', attributes: inheritedAttributes});
                 } else if (node.nodeType === Node.ELEMENT_NODE) {
-                  let currentUrl = inheritedUrl;
+                  let currentAttributes = [...inheritedAttributes];
                   let isImageSpan = false;
                   
-                  // Check for hyperlinks
-                  if (node.nodeName === 'A' && node.getAttribute('href')) {
-                    let href = node.getAttribute('href');
-                    if (href && href.trim() !== '' && !href.trim().toLowerCase().startsWith('javascript:')) {
-                      if (!/^(https?:\/\/|mailto:|ftp:|file:|#|\/)/i.test(href)) {
-                        href = `http://${href}`;
+                  if (node.classList) {
+                    for (const cls of node.classList) {
+                      if (cls.startsWith('hyperlink-')) {
+                        try { currentAttributes.push(['hyperlink', decodeURIComponent(cls.slice('hyperlink-'.length))]); } catch {}
+                      } else if (cls.startsWith('color:')) {
+                        currentAttributes.push(['color', cls.slice('color:'.length)]);
+                      } else if (cls.startsWith('font-size:')) {
+                        currentAttributes.push(['font-size', cls.slice('font-size:'.length)]);
+                      } else if (cls === 'sup') {
+                        currentAttributes.push(['sup', 'true']);
+                        if (DEBUG) console.log('[docx_customizer] detected sup class');
+                      } else if (cls === 'sub') {
+                        currentAttributes.push(['sub', 'true']);
+                        if (DEBUG) console.log('[docx_customizer] detected sub class');
                       }
-                      currentUrl = href;
                     }
                   }
                   
-                  // Detect span with hyperlink classes (produced by customizeDocument)
-                  if (!currentUrl && node.classList) {
-                    const m = Array.from(node.classList).find(c => c.startsWith('hyperlink-'));
-                    if (m) {
-                      try { currentUrl = decodeURIComponent(m.slice('hyperlink-'.length)); } catch {}
-                    }
+                  if (node.nodeName === 'A' && node.getAttribute('href')) {
+                    currentAttributes.push(['hyperlink', node.getAttribute('href')]);
                   }
                   
-                  // Detect image spans (produced by customizeDocument and inlineImages)
+                  // Direct tag-based detection for superscript/subscript
+                  if (node.nodeName === 'SUP') {
+                    currentAttributes.push(['sup', 'true']);
+                    if (DEBUG) console.log('[docx_customizer] detected <SUP> tag');
+                  } else if (node.nodeName === 'SUB') {
+                    currentAttributes.push(['sub', 'true']);
+                    if (DEBUG) console.log('[docx_customizer] detected <SUB> tag');
+                  }
+                  
                   if (node.classList && node.classList.contains('inline-image')) {
                     isImageSpan = true;
-                    // Extract image URL from class
                     const imageMatch = Array.from(node.classList).find(c => c.startsWith('image:'));
                     if (imageMatch) {
                       try {
-                        const imageUrl = decodeURIComponent(imageMatch.slice('image:'.length));
-                        // Add image as a special text segment that will be converted to image span
                         segments.push({
-                          text: '\u200B', // ZWSP placeholder
-                          url: null,
-                          isImage: true,
-                          imageUrl: imageUrl,
-                          imageClasses: node.className
+                          text: '\u200B', isImage: true,
+                          imageUrl: decodeURIComponent(imageMatch.slice('image:'.length)),
+                          imageClasses: node.className,
+                          attributes: [],
                         });
-                      } catch (e) {
-                        if (DEBUG) console.warn('[docx_customizer] failed to extract image URL from class', e);
-                      }
+                      } catch (e) {}
                     }
                   }
-                  
-                  // Don't recurse into image spans (they just contain ZWSP)
                   if (!isImageSpan) {
                     for (let i = 0; i < node.childNodes.length; i++) {
-                      extractSegmentsRecursive(node.childNodes[i], currentUrl);
+                      extractSegmentsRecursive(node.childNodes[i], currentAttributes);
+                    }
+                  }
+
+                  // Detect style-based superscript/subscript (e.g., Google Docs uses vertical-align)
+                  if (!currentAttributes.some(a => a[0]==='sup' || a[0]==='sub')) {
+                    const vAlign = (node.style && node.style.verticalAlign || '').toLowerCase();
+                    if (vAlign === 'super') {
+                      currentAttributes.push(['sup','true']);
+                      if (DEBUG) console.log('[docx_customizer] detected vertical-align:super');
+                    } else if (vAlign === 'sub') {
+                      currentAttributes.push(['sub','true']);
+                      if (DEBUG) console.log('[docx_customizer] detected vertical-align:sub');
                     }
                   }
                 }
               };
-
               for (let i = 0; i < tempDivSeg.childNodes.length; i++) {
-                extractSegmentsRecursive(tempDivSeg.childNodes[i], null);
+                extractSegmentsRecursive(tempDivSeg.childNodes[i], []);
               }
 
-              if (segments.length === 0 && tempDivSeg.textContent) {
-                segments.push({text: tempDivSeg.textContent, url: null});
-              }
+              const cleanedSegments = segments.map(s => {
+                s.text = s.isImage ? '\u200B' : (s.text || '').replace(/(\r\n|\n|\r)/gm, ' ').replace(new RegExp(DELIMITER, 'g'), ' ').replace(/\t/g, ' ').trim();
+                return s;
+              }).filter(s => s.text.length > 0 || s.isImage);
+              if (cleanedSegments.length === 0) return;
 
-              // Sanitize each segment and filter empties
-              segments.forEach((seg) => {
-                if (seg.isImage) {
-                  // For image segments, preserve the ZWSP character
-                  seg.text = '\u200B';
-                } else {
-                  seg.text = (seg.text || '')
-                    .replace(/(\r\n|\n|\r)/gm, ' ')
-                    .replace(new RegExp(DELIMITER, 'g'), ' ')
-                    .replace(/\t/g, ' ')
-                    .replace(/\s+/g, ' ')
-                    .trim();
-                }
-              });
-              const cleanedSegments = segments.filter((s) => s.text.length > 0 || s.isImage);
-              if (cleanedSegments.length === 0) {
-                if (DEBUG) console.log('[docx_customizer] No text after sanitization – abort paste');
-                return;
-              }
+              ace.ace_performDocumentReplaceRange(selStart, selEnd, '');
+              let currentPos = ace.ace_getRep().selStart;
 
-              // Enforce maximum cell length like ep_tables5
-              const selectionLength = selEnd[1] - selStart[1];
-              const currentCellText = cells[targetCellIndex] || '';
-              const MAX_CELL_LENGTH = 8000;
-              let remaining = MAX_CELL_LENGTH - (currentCellText.length - selectionLength);
-              if (remaining <= 0) {
-                if (DEBUG) console.log('[docx_customizer] Cell at max length – abort paste');
-                return;
-              }
-
-              // ================= EXACT insertion loop from ep_hyperlinked_text (isTableLine forced true) =================
-              let selStartMod = selStart.slice();
-              let selEndMod   = selEnd.slice();
-
-              if (selStartMod[0] !== selEndMod[0] || selStartMod[1] !== selEndMod[1]) {
-                ace.ace_performDocumentReplaceRange(selStartMod, selEndMod, '');
-                selEndMod = selStartMod.slice();
-              }
-
-              let currentLine = selStartMod[0];
-              let currentCol  = selStartMod[1];
-
-              if (DEBUG) console.log('[docx_customizer] cleanedSegments', cleanedSegments.length, cleanedSegments);
-
-              for (let segIdx = 0; segIdx < cleanedSegments.length; segIdx++) {
-                const segment = cleanedSegments[segIdx];
-                let textToInsert = segment.text;
-                textToInsert = textToInsert.replace(/\n+/g, ' '); // table line flatten
-
-                // Conditional leading space (same as hyperlinked plugin)
-                if (segIdx > 0) {
-                  const previousSegment = cleanedSegments[segIdx - 1];
-                  /* Insert a literal space only when BOTH neighbouring segments are plain text.
-                     Image placeholders must keep their exact ZWSP-…-ZWSP pattern or ep_images_extended
-                     cannot detect them for resize/float handling. */
-                  if (!segment.isImage && !previousSegment.isImage &&
-                      previousSegment.text.length > 0 && textToInsert.length > 0 &&
-                      !/\s$/.test(previousSegment.text) && !/^\s/.test(textToInsert)) {
-                      ace.ace_performDocumentReplaceRange([currentLine, currentCol],
-                                                          [currentLine, currentCol], ' ');
-                    const repAfterSpace = ace.ace_getRep();
-                    currentLine = repAfterSpace.selEnd[0];
-                    currentCol  = repAfterSpace.selEnd[1];
+              for (let i = 0; i < cleanedSegments.length; i++) {
+                const seg = cleanedSegments[i];
+                
+                // Add a space between segments if needed
+                if (i > 0) {
+                  const prevSeg = cleanedSegments[i - 1];
+                  if (!seg.isImage && !prevSeg.isImage && seg.text.length > 0 && prevSeg.text.length > 0 &&
+                      !/\s$/.test(prevSeg.text) && !/^\s/.test(seg.text)) {
+                    ace.ace_performDocumentReplaceRange(currentPos, currentPos, ' ');
+                    currentPos = ace.ace_getRep().selEnd;
                   }
                 }
 
-                if (textToInsert.length > 0) {
-                  if (DEBUG) console.log(`[docx_customizer] seg${segIdx}: inserting ${segment.isImage ? 'image' : 'text'} "${textToInsert.slice(0,80)}" (len ${textToInsert.length}) url=${segment.url || 'none'} at L${currentLine}C${currentCol}`);
-                  const insertStart = [currentLine, currentCol];
-                  ace.ace_performDocumentReplaceRange(insertStart, insertStart, textToInsert);
-
-                  const repAfterTxt = ace.ace_getRep();
-                  const insertEndLine = repAfterTxt.selEnd[0];
-                  const insertEndCol  = repAfterTxt.selEnd[1];
-
-                  // Apply hyperlink attribute
-                  if (segment.url) {
-                    if (DEBUG) console.log(`[docx_customizer] seg${segIdx}: applying hyperlink attr to range L${insertStart[0]}C${insertStart[1]} - L${insertEndLine}C${insertEndCol}`);
-                    try {
-                      ace.ace_performDocumentApplyAttributesToRange(insertStart, [insertEndLine, insertEndCol], [['hyperlink', segment.url]]);
-                    } catch (attrErr) {
-                      console.warn('[docx_customizer] Failed to apply hyperlink attribute', attrErr);
-                    }
+                ace.ace_performDocumentReplaceRange(currentPos, currentPos, seg.text);
+                let endPos = ace.ace_getRep().selEnd;
+                
+                if (seg.attributes && seg.attributes.length > 0) {
+                  if (DEBUG) {
+                    const supAttr = seg.attributes.find(a => a[0]==='sup');
+                    const subAttr = seg.attributes.find(a => a[0]==='sub');
+                    if (supAttr) console.log('[docx_customizer] applying sup attribute to segment', seg.text);
+                    if (subAttr) console.log('[docx_customizer] applying sub attribute to segment', seg.text);
                   }
-
-                  // Apply image attributes if this is an image segment
-                  if (segment.isImage && segment.imageUrl) {
-                    if (DEBUG) console.log(`[docx_customizer] seg${segIdx}: applying image attributes for ${segment.imageUrl}`);
-                    if (DEBUG) console.log(`[docx_customizer] seg${segIdx}: imageClasses = "${segment.imageClasses}"`);
-                    try {
-                      // Parse image classes to extract individual attributes
-                      const classes = (segment.imageClasses || '').split(' ');
-                      const imageAttrs = [];
-                      
-                      // Add the main image URL – ensure it is percent-encoded so the resulting
-                      // `image:` class contains a valid CSS identifier.  This matters especially
-                      // for images pasted into ep_tables5 cells where the URL was previously left
-                      // unencoded ("image:https://…") and therefore broke resize handling.
-                      const encodedUrl = encodeURIComponent(segment.imageUrl);
-                      imageAttrs.push(['image', encodedUrl]);
-                      
-                      // Extract other image attributes from classes
-                      for (const cls of classes) {
-                        if (cls.startsWith('image-width:')) {
-                          imageAttrs.push(['image-width', cls.slice('image-width:'.length)]);
-                        } else if (cls.startsWith('image-height:')) {
-                          imageAttrs.push(['image-height', cls.slice('image-height:'.length)]);
-                        } else if (cls.startsWith('imageCssAspectRatio:')) {
-                          imageAttrs.push(['imageCssAspectRatio', cls.slice('imageCssAspectRatio:'.length)]);
-                        } else if (cls.startsWith('image-id-')) {
-                          imageAttrs.push(['image-id', cls.slice('image-id-'.length)]);
-                        }
-                      }
-                      
-                      if (DEBUG) console.log(`[docx_customizer] seg${segIdx}: extracted image attributes:`, imageAttrs);
-                      
-                      // Apply all image attributes
-                      if (imageAttrs.length > 0) {
-                        ace.ace_performDocumentApplyAttributesToRange(insertStart, [insertEndLine, insertEndCol], imageAttrs);
-                        if (DEBUG) console.log(`[docx_customizer] seg${segIdx}: successfully applied ${imageAttrs.length} image attributes`);
-                      } else {
-                        if (DEBUG) console.warn(`[docx_customizer] seg${segIdx}: no image attributes to apply`);
-                      }
-                    } catch (attrErr) {
-                      console.warn('[docx_customizer] Failed to apply image attributes', attrErr);
-                    }
-                  } else if (segment.isImage) {
-                    if (DEBUG) console.warn(`[docx_customizer] seg${segIdx}: image segment missing required data - imageUrl: ${!!segment.imageUrl}, imageClasses: ${!!segment.imageClasses}`);
-                  }
-
-                  if (DEBUG) console.log(`[docx_customizer] seg${segIdx}: after insertion caret at L${insertEndLine}C${insertEndCol}`);
-                  currentLine = insertEndLine;
-                  currentCol  = insertEndCol;
+                  ace.ace_performDocumentApplyAttributesToRange(currentPos, endPos, seg.attributes);
                 }
-              }
-              if (DEBUG) console.log('[docx_customizer] Finished segment loop. Final caret', currentLine, currentCol);
 
-              // Reapply tbljson metadata after paste
-              if (ace.ep_tables5_applyMeta && tableMetaBefore && typeof tableMetaBefore.cols === 'number') {
-                const repAfter = ace.ace_getRep();
-                const docMgrSafe = docMgrPre;
-                ace.ep_tables5_applyMeta(
-                  lineNum,
-                  tableMetaBefore.tblId,
-                  tableMetaBefore.row,
-                  tableMetaBefore.cols,
-                  repAfter,
-                  ace,
-                  null,
-                  docMgrSafe,
-                );
+                if (seg.isImage && seg.imageUrl) {
+                  const imageAttrs = (seg.imageClasses || '').split(' ').map(cls => {
+                      if (cls.startsWith('image-width:')) return ['image-width', cls.slice('image-width:'.length)];
+                      if (cls.startsWith('image-height:')) return ['image-height', cls.slice('image-height:'.length)];
+                      if (cls.startsWith('imageCssAspectRatio:')) return ['imageCssAspectRatio', cls.slice('imageCssAspectRatio:'.length)];
+                      if (cls.startsWith('image-id-')) return ['image-id', cls.slice('image-id-'.length)];
+                      return null;
+                  }).filter(Boolean);
+                  imageAttrs.push(['image', encodeURIComponent(seg.imageUrl)]);
+                  ace.ace_performDocumentApplyAttributesToRange(currentPos, endPos, imageAttrs);
+                }
+                currentPos = ace.ace_getRep().selEnd;
               }
-
-              ace.ace_performSelectionChange([currentLine, currentCol], [currentLine, currentCol], false);
               ace.ace_fastIncorp && ace.ace_fastIncorp(10);
-
-              if (DEBUG) console.log('[docx_customizer] Hyperlink-aware table-cell paste completed');
-
             } catch (errPaste) {
-              console.error('[docx_customizer] error during plain-text table paste', errPaste);
+              console.error('[docx_customizer] error during rich-text table paste', errPaste);
             }
           } else {
-            // Normal (non-table) insertion – keep HTML & formatting
             ace.ace_inCallStackIfNecessary('docxPaste', () => {
-              // 1) Let the browser paste the HTML so spans with tbljson-* classes
-              //    land in the DOM and Ace converts them into atext.
               const innerWin = $innerIframe[0].contentWindow;
               innerWin.document.execCommand('insertHTML', false, finalHtml);
-
-              // 2) Sync to Ace's internal document model.
-              ace.ace_fastIncorp && ace.ace_fastIncorp(10);
-
-              const rep     = ace.ace_getRep();
-              const docMgr  = ace.documentAttributeManager || ace.editorInfo?.documentAttributeManager;
-              if (!rep || !docMgr) return;
-
-              // Determine a conservative line range that likely contains the newly
-              // inserted block – from the first line of the current selection to
-              // the current end of the document.
-              const firstLine = (rep.selStart && Array.isArray(rep.selStart)) ? rep.selStart[0] : 0;
-              const lastLine  = rep.lines.length() - 1;
-
-              for (let ln = firstLine; ln <= lastLine; ln++) {
-                const attrStr = docMgr.getAttributeOnLine(ln, ATTR_TABLE_JSON);
-                if (!attrStr) continue; // not a table row
-
-                let meta;
-                try { meta = JSON.parse(attrStr); } catch (_) {/* ignore */}
-
-                const lineText = rep.lines.atIndex(ln).text || '';
-                const cells    = lineText.split(DELIMITER);
-
-                // 3) Apply the per-cell td attribute so Etherpad produces author spans.
-                let offset = 0;
-                cells.forEach((cellTxt, idx) => {
-                  if (cellTxt.length > 0) {
-                    ace.ace_performDocumentApplyAttributesToRange(
-                      [ln, offset], [ln, offset + cellTxt.length], [[ATTR_CELL, String(idx)]]);
-                  }
-                  offset += cellTxt.length;
-                  if (idx < cells.length - 1) offset += DELIMITER.length;
-                });
-
-                // 4) Re-assert tbljson line attribute via official helper to make
-                //    sure column-width metadata is stored.
-                if (ace.ep_tables5_applyMeta && meta && typeof meta.cols === 'number') {
-                  ace.ep_tables5_applyMeta(
-                    ln,
-                    meta.tblId,
-                    meta.row,
-                    meta.cols,
-                    rep,
-                    ace,
-                    null,
-                    docMgr,
-                  );
-                }
-              }
-
-              // Final sync so the attribute changes are flushed.
-              ace.ace_fastIncorp && ace.ace_fastIncorp(10);
             });
           }
         }, 'docxPaste', true);
       });
-
-      if (DEBUG) console.log('[docx_customizer] insertion done, event propagation stopped');
     });
-
-    if (DEBUG) console.log('[docx_customizer] paste listener attached');
   }, 'setupDocxCustomizerPaste', true);
+};
+
+exports.collectContentPre = (hookName, context) => {
+  const {cls, cc, state} = context;
+  if (!cls) return;
+
+  const tblJsonClass = /(?:^| )(tbljson-[^ ]*)/.exec(cls);
+  if (tblJsonClass) {
+    const encoded = tblJsonClass[1].substring(8); // "tbljson-".length
+    const decoded = dec(encoded);
+    if (decoded) {
+      cc.doAttrib(state, `${ATTR_TABLE_JSON}::${decoded}`);
+    }
+  }
+
+  const tblCellClass = /(?:^| )(tblCell-[^ ]*)/.exec(cls);
+  if (tblCellClass) {
+    const cellIdx = tblCellClass[1].substring(8); // "tblCell-".length
+    cc.doAttrib(state, `td::${cellIdx}`);
+  }
+};
+
+exports.aceAttribsToClasses = (hook, context) => {
+  if (context.key === ATTR_TABLE_JSON) {
+    return [`tbljson-${enc(context.value)}`];
+  }
+  if (context.key === ATTR_CELL) {
+    return [`tblCell-${context.value}`];
+  }
+  return [];
 }; 

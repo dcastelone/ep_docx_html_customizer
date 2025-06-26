@@ -8,7 +8,9 @@
         "expressCreateServer": "ep_docx_html_customizer/index.js"
       },
       "client_hooks": {
-        "postAceInit": "ep_docx_html_customizer/static/js/clipboard"
+        "postAceInit": "ep_docx_html_customizer/static/js/clipboard",
+        "collectContentPre": "ep_docx_html_customizer/static/js/clipboard",
+        "aceAttribsToClasses": "ep_docx_html_customizer/static/js/clipboard"
       }
     }
   ]

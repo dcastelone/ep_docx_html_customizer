@@ -399,7 +399,9 @@ function customizeDocument(document, options = {}) {
         if(!classes.includes(cls)){classes.push(cls);changed=true;}
       }
     }
-    const sizeStyle=el.style.fontSize;
+    // Skip font-size mapping for <sup>/<sub> to preserve normal baseline sizing
+    const isSuperOrSub = el.tagName && (el.tagName.toUpperCase()==='SUP' || el.tagName.toUpperCase()==='SUB');
+    const sizeStyle=isSuperOrSub ? '' : el.style.fontSize;
     if(sizeStyle){
       const px=parsePx(sizeStyle);
       if(px){
@@ -447,24 +449,27 @@ function customizeDocument(document, options = {}) {
       rows.forEach((rowNode, rowIdx) => {
         const rawCells = Array.from(rowNode.querySelectorAll('td, th'));
         let rawPtr = 0;
-        const cellTexts = new Array(numCols);
+        const cellHTMLs = [];
 
         for (let col = 0; col < numCols; col++) {
           if (pendingRowspan[col] > 0) {
-            pendingRowspan[col]--; cellTexts[col] = ' <span>&nbsp;</span>'; continue;
+            pendingRowspan[col]--;
+            cellHTMLs.push('<span>&nbsp;</span>');
+            continue;
           }
 
           const cell = rawCells[rawPtr++];
-          if (!cell) { cellTexts[col] = ' <span>&nbsp;</span>'; continue; }
+          if (!cell) {
+            cellHTMLs.push('<span>&nbsp;</span>');
+            continue;
+          }
 
           let colspan = parseInt(cell.getAttribute('colspan') || '1', 10);
           let rowspan = parseInt(cell.getAttribute('rowspan') || '1', 10);
           if (isNaN(colspan) || colspan < 1) colspan = 1;
           if (isNaN(rowspan) || rowspan < 1) rowspan = 1;
 
-          // flatten inner content similar to DOCX import logic
           let html = cell.innerHTML.replace(/\r?\n/g, ' ').trim();
-
           const tmp = document.createElement('div');
           tmp.innerHTML = html;
           const heading = tmp.querySelector('h1, h2, h3, h4, h5, h6');
@@ -493,7 +498,6 @@ function customizeDocument(document, options = {}) {
           if (/^<br\/?>(\s*)?$/i.test(html)) html = '';
           if (html) html = html.replace(/(<br\s*\/?>\s*)+$/gi, '').replace(/<br\s*\/?>/gi, ' ').trim();
 
-          // Detect cells that are visibly empty (may contain only &nbsp;/whitespace)
           let visiblyEmpty = false;
           if (!html) {
             visiblyEmpty = true;
@@ -504,26 +508,39 @@ function customizeDocument(document, options = {}) {
             visiblyEmpty = txt === '';
           }
 
-          if (visiblyEmpty) html = ' <span>&nbsp;</span>';
+          if (visiblyEmpty) html = '<span>&nbsp;</span>';
 
-          cellTexts[col] = html;
+          cellHTMLs.push(html);
 
           if (rowspan > 1) pendingRowspan[col] = rowspan - 1;
           for (let extra = 1; extra < colspan && col + extra < numCols; extra++) {
-            cellTexts[col + extra] = ' <span>&nbsp;</span>';
+            cellHTMLs.push('<span>&nbsp;</span>');
             if (rowspan > 1) pendingRowspan[col + extra] = rowspan - 1;
           }
           col += colspan - 1;
         }
 
-        const lineText = cellTexts.join(DELIMITER);
         const meta = {tblId: `${tblIdBase}-${tableIdx}`, row: rowIdx, cols: numCols};
-        const encoded = enc(JSON.stringify(meta));
+        const encodedMeta = enc(JSON.stringify(meta));
+        const lineDiv = document.createElement('div');
+        
+        cellHTMLs.forEach((cellHTML, cellIdx) => {
+            const span = document.createElement('span');
+            span.className = `tbljson-${encodedMeta} tblCell-${cellIdx}`;
+            span.innerHTML = cellHTML;
+            lineDiv.appendChild(span);
+            if (cellIdx < cellHTMLs.length - 1) {
+                lineDiv.appendChild(document.createTextNode(DELIMITER));
+            }
+        });
+        
+        // Add the final, empty span that ep_tables5 expects to exist at the end
+        // of the line. This span will hold line-level attributes and eventually the caret anchor.
+        const finalSpan = document.createElement('span');
+        finalSpan.className = `tbljson-${encodedMeta}`;
+        lineDiv.appendChild(finalSpan);
 
-        const div = document.createElement('div');
-        div.className = `tbljson-${encoded}`;
-        div.innerHTML = lineText;
-        newLines.push(div);
+        newLines.push(lineDiv);
       });
 
       if (newLines.length) {
@@ -534,6 +551,23 @@ function customizeDocument(document, options = {}) {
       }
     });
   }
+
+  /* ───────────── Superscript / Subscript (vertical-align) ───────────── */
+  const vaElements = Array.from(document.querySelectorAll('[style*="vertical-align" ]'));
+  vaElements.forEach((el) => {
+    const vAlign = (el.style && el.style.verticalAlign || '').toLowerCase();
+    if (vAlign !== 'super' && vAlign !== 'sub') return;
+
+    const tagNameTarget = vAlign === 'super' ? 'sup' : 'sub';
+    const newTag = document.createElement(tagNameTarget);
+
+    // Preserve existing classes (excluding sup/sub to avoid duplication later)
+    newTag.className = (el.className || '').replace(/\b(sup|sub)\b/g, '').trim();
+    newTag.innerHTML = el.innerHTML;
+
+    el.parentNode.replaceChild(newTag, el);
+    modified = true;
+  });
 
   return modified;
 }
