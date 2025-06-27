@@ -353,6 +353,30 @@ exports.collectContentPre = (hookName, context) => {
     const cellIdx = tblCellClass[1].substring(8); // "tblCell-".length
     cc.doAttrib(state, `td::${cellIdx}`);
   }
+
+  /* ─────────────────────────── Font-size normalisation ───────────────────────────
+   * ep_font_size's collectContentPre wrongly encodes the value in the key
+   * ("font-size:12") which prevents later edits from overwriting the old size.
+   * If we spot a class that matches that legacy pattern we:
+   *   1. Add the canonical attribute "font-size::N" so Etherpad stores the size
+   *      in the value position (same shape the toolbar uses).
+   *   2. Remove the legacy class from the class list before ep_font_size gets
+   *      its turn, thereby preventing it from re-adding the broken attribute.
+   *
+   * This keeps the visual appearance identical but avoids duplicate
+   * font-size attributes once the user changes the size via the toolbar.
+   */
+  const fsMatch = /(?:^| )font-size:([0-9]+)(?= |$)/.exec(cls);
+  if (fsMatch && fsMatch[1]) {
+    const sizeVal = fsMatch[1];
+    // Inject correct attribute (key "font-size", value = <size>)
+    cc.doAttrib(state, `font-size::${sizeVal}`);
+
+    // Strip *all* occurrences of the legacy class so the downstream plugin
+    // doesn't create an extra attribute with the value baked into the key.
+    const clsClean = cls.replace(new RegExp(`(?:^| )font-size:${sizeVal}(?= |$)`, 'g'), ' ').trim();
+    context.cls = clsClean; // propagate the mutation to later hooks
+  }
 };
 
 exports.aceAttribsToClasses = (hook, context) => {
