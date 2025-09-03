@@ -76,37 +76,39 @@ async function uploadImageToS3Browser(blob, filename, padId) {
       throw new Error('Not in browser environment');
     }
     
-    if (typeof clientVars === 'undefined') {
-      throw new Error('clientVars not available');
-    }
-    
-    console.log('[transform_common] clientVars.ep_images_extended:', clientVars.ep_images_extended);
-    
-    if (!clientVars.ep_images_extended) {
-      throw new Error('ep_images_extended not configured in clientVars');
-    }
-    
-    if (clientVars.ep_images_extended.storageType !== 's3_presigned') {
-      throw new Error(`Storage type is "${clientVars.ep_images_extended.storageType}", expected "s3_presigned"`);
-    }
-
-    // Get presigned URL from ep_images_extended
+    // Prefer capability detection over strict config checks: try presign endpoint first.
+    // If it fails, return null so callers can fall back gracefully.
     const queryParams = new URLSearchParams({ name: filename, type: blob.type });
     const basePath = window.location.pathname.split('/p/')[0] || '';
-    const presignUrl = `${basePath}/p/${padId}/pluginfw/ep_images_extended/s3_presign?${queryParams}`;
+    const candidates = [
+      `${basePath}/p/${padId}/pluginfw/ep_images_extended/s3_presign?${queryParams}`,
+      `/p/${padId}/pluginfw/ep_images_extended/s3_presign?${queryParams}`,
+    ];
     
-    console.log('[transform_common] requesting presign URL:', presignUrl);
-    console.log('[transform_common] parameters:', { name: filename, type: blob.type, padId });
-    
-    const presignResp = await fetch(presignUrl);
-
-    if (!presignResp.ok) {
-      const errorText = await presignResp.text();
-      console.error('[transform_common] presign error response:', errorText);
-      throw new Error(`Presign request failed: ${presignResp.status} - ${errorText}`);
+    let presignData = null;
+    let lastErrText = '';
+    for (const url of candidates) {
+      try {
+        const resp = await fetch(url);
+        if (!resp.ok) {
+          lastErrText = await resp.text().catch(() => '');
+          continue;
+        }
+        const json = await resp.json();
+        if (json && json.signedUrl && json.publicUrl) {
+          presignData = json;
+          break;
+        }
+      } catch (e) {
+        lastErrText = String(e && e.message || e);
+      }
     }
 
-    const presignData = await presignResp.json();
+    if (!presignData) {
+      console.warn('[transform_common] presign not available, falling back (reason):', lastErrText);
+      return null;
+    }
+
     if (!presignData.signedUrl || !presignData.publicUrl) {
       throw new Error('Invalid presign response');
     }
