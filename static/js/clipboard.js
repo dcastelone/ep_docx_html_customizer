@@ -68,70 +68,80 @@ exports.postAceInit = (hook, context) => {
           const m = sp.className.match(/image:([^ ]+)/);
           if (!m) return;
           let url = decodeURIComponent(m[1]);
-          if (!/^https?:/.test(url) || url.startsWith('data:')) return;
           try {
-            let resp;
-            try {
-              resp = await fetch(url, {mode: 'cors'});
-              if (!resp.ok) throw new Error(`status ${resp.status}`);
-            } catch (corsErr) {
-              /*
-               * Direct CORS fetch failed – fall back to our same-origin proxy.  Depending on the
-               * deployment, Etherpad might live at a sub-path (e.g., /pad/), so try a handful of
-               * potential proxy locations before giving up.  This mirrors the robust behaviour we
-               * had in the previous plugin iteration (see temp/clipboard.js).
-               */
-              const basePath = window.location.pathname.split('/p/')[0] || '';
-              const proxyVariants = [
-                `${basePath}/ep_docx_image_proxy?url=${encodeURIComponent(url)}`,
-                `/ep_docx_image_proxy?url=${encodeURIComponent(url)}`,
-                `${window.location.origin}${basePath}/ep_docx_image_proxy?url=${encodeURIComponent(url)}`,
-              ];
+            let blob;
+            const padId = (typeof clientVars !== 'undefined') ? clientVars.padId : 'clipboard';
+            let filename = `image-${Date.now()}`;
 
-              let proxySuccess = false;
-              for (const proxyUrl of proxyVariants) {
-                try {
-                  resp = await fetch(proxyUrl);
-                  if (resp.ok) { proxySuccess = true; break; }
-                  if (DEBUG) console.warn(`[docx_customizer] proxy ${proxyUrl} returned ${resp.status}`);
-                } catch (proxyErr) {
-                  if (DEBUG) console.warn(`[docx_customizer] proxy attempt failed ${proxyUrl}`, proxyErr);
+            if (url.startsWith('data:')) {
+              // Convert data URL to Blob so we can upload via S3 presign
+              const commaIdx = url.indexOf(',');
+              if (commaIdx === -1) return;
+              const header = url.substring(0, commaIdx);
+              const b64 = url.substring(commaIdx + 1);
+              const mimeMatch = /data:([^;]+);base64/i.exec(header);
+              const mimeType = (mimeMatch && mimeMatch[1]) || 'application/octet-stream';
+              const binary = atob(b64);
+              const len = binary.length;
+              const bytes = new Uint8Array(len);
+              for (let i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i);
+              blob = new Blob([bytes], {type: mimeType});
+              const ext = (mimeType.split('/')[1] || 'png');
+              filename += `.${ext}`;
+            } else if (/^https?:/.test(url)) {
+              // Fetch remote and fall back to same-origin proxy on CORS failure
+              let resp;
+              try {
+                resp = await fetch(url, {mode: 'cors'});
+                if (!resp.ok) throw new Error(`status ${resp.status}`);
+              } catch (corsErr) {
+                const basePath = window.location.pathname.split('/p/')[0] || '';
+                const proxyVariants = [
+                  `${basePath}/ep_docx_image_proxy?url=${encodeURIComponent(url)}`,
+                  `/ep_docx_image_proxy?url=${encodeURIComponent(url)}`,
+                  `${window.location.origin}${basePath}/ep_docx_image_proxy?url=${encodeURIComponent(url)}`,
+                ];
+                let proxySuccess = false;
+                for (const proxyUrl of proxyVariants) {
+                  try {
+                    resp = await fetch(proxyUrl);
+                    if (resp.ok) { proxySuccess = true; break; }
+                    if (DEBUG) console.warn(`[docx_customizer] proxy ${proxyUrl} returned ${resp.status}`);
+                  } catch (proxyErr) {
+                    if (DEBUG) console.warn(`[docx_customizer] proxy attempt failed ${proxyUrl}`, proxyErr);
+                  }
                 }
+                if (!proxySuccess) throw new Error('All proxy attempts failed');
               }
-
-              if (!proxySuccess) throw new Error('All proxy attempts failed');
-            }
-            const blob = await resp.blob();
-              const padId = (typeof clientVars !== 'undefined') ? clientVars.padId : 'clipboard';
-            let filename = new URL(url).pathname.split('/').pop() || `image-${Date.now()}`;
-            // Ensure the filename has a proper extension recognised by ep_images_extended.
-            // Some sources (e.g. Google Drive) expose images via extension-less paths which will
-            // cause the presign endpoint to reject them (“File type not allowed”).  Derive the
-            // extension from the MIME type if missing.
-            if (!/\.[A-Za-z0-9]+$/.test(filename)) {
-              const mimeExt = (blob.type && blob.type.split('/')[1]) || 'png';
-              filename += `.${mimeExt}`;
+              blob = await resp.blob();
+              const urlName = new URL(url).pathname.split('/').pop() || filename;
+              filename = urlName;
+              if (!/\.[A-Za-z0-9]+$/.test(filename)) {
+                const mimeExt = (blob.type && blob.type.split('/')[1]) || 'png';
+                filename += `.${mimeExt}`;
+              }
+            } else {
+              return; // unsupported scheme
             }
 
             const finalUrl = await uploadImageToS3Browser(blob, filename, padId);
             if (!finalUrl) throw new Error('S3 upload failed');
-            
-              const dim = await new Promise((res, rej) => {
-                const imgObj = new Image();
-                imgObj.onload = () => res({w: imgObj.naturalWidth, h: imgObj.naturalHeight});
-                imgObj.onerror = rej;
-                imgObj.src = URL.createObjectURL(blob);
-              });
-              if (dim && dim.w && dim.h) {
-                const ratio = (dim.w / dim.h).toFixed(4);
-                const hasWidthCls  = Array.from(sp.classList).some(c => c.startsWith('image-width:'));
-                const hasHeightCls = Array.from(sp.classList).some(c => c.startsWith('image-height:'));
-                const hasRatioCls  = Array.from(sp.classList).some(c => c.startsWith('imageCssAspectRatio:'));
 
-                if (!hasWidthCls)  sp.classList.add(`image-width:${dim.w}px`);
-                if (!hasHeightCls) sp.classList.add(`image-height:${dim.h}px`);
-                if (!hasRatioCls)  sp.classList.add(`imageCssAspectRatio:${ratio}`);
-              }
+            const dim = await new Promise((res, rej) => {
+              const imgObj = new Image();
+              imgObj.onload = () => res({w: imgObj.naturalWidth, h: imgObj.naturalHeight});
+              imgObj.onerror = rej;
+              imgObj.src = URL.createObjectURL(blob);
+            });
+            if (dim && dim.w && dim.h) {
+              const ratio = (dim.w / dim.h).toFixed(4);
+              const hasWidthCls  = Array.from(sp.classList).some(c => c.startsWith('image-width:'));
+              const hasHeightCls = Array.from(sp.classList).some(c => c.startsWith('image-height:'));
+              const hasRatioCls  = Array.from(sp.classList).some(c => c.startsWith('imageCssAspectRatio:'));
+              if (!hasWidthCls)  sp.classList.add(`image-width:${dim.w}px`);
+              if (!hasHeightCls) sp.classList.add(`image-height:${dim.h}px`);
+              if (!hasRatioCls)  sp.classList.add(`imageCssAspectRatio:${ratio}`);
+            }
             sp.className = sp.className.replace(m[1], encodeURIComponent(finalUrl));
           } catch (e) {
             if (DEBUG) console.warn('[docx_customizer] failed to inline', url, e);
