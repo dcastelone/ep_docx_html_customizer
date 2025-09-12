@@ -74,23 +74,18 @@ exports.postAceInit = (hook, context) => {
             let filename = `image-${Date.now()}`;
 
             if (url.startsWith('data:')) {
-              // Convert data URI to Blob so we can upload via S3 presign and avoid embedding base64 in the pad
+              // Convert data URL to Blob so we can upload via S3 presign
               const commaIdx = url.indexOf(',');
               if (commaIdx === -1) return;
               const header = url.substring(0, commaIdx);
               const b64 = url.substring(commaIdx + 1);
               const mimeMatch = /data:([^;]+);base64/i.exec(header);
               const mimeType = (mimeMatch && mimeMatch[1]) || 'application/octet-stream';
-              try {
-                const binary = atob(b64);
-                const len = binary.length;
-                const bytes = new Uint8Array(len);
-                for (let i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i);
-                blob = new Blob([bytes], {type: mimeType});
-              } catch (_) {
-                if (DEBUG) console.warn('[docx_customizer] Failed to decode data URI');
-                return;
-              }
+              const binary = atob(b64);
+              const len = binary.length;
+              const bytes = new Uint8Array(len);
+              for (let i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i);
+              blob = new Blob([bytes], {type: mimeType});
               const ext = (mimeType.split('/')[1] || 'png');
               filename += `.${ext}`;
             } else if (/^https?:/.test(url)) {
