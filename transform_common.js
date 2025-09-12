@@ -289,18 +289,23 @@ function customizeDocument(document, options = {}) {
     let src = img.getAttribute('src');
     if (!src) return;
 
+    // If the source is a base-64 data URI we must upload it to S3 first; otherwise we would
+    // commit the entire blob to the pad.  We reuse the client-side S3 helper already in this
+    // module.  On failure we simply drop the image to avoid leaking base64.
+    if (src.startsWith('data:')) {
+      // Skip Base-64 data-URI images entirely – we refuse to commit them.
+      return; // remove the <img> by exiting early
+    }
+
+    // Disable automatic inline conversion of relative images to base-64 data URIs –
+    // we never want to commit large base64 blobs to the pad.  If the image is not
+    // already a http/https or data URI we simply keep the original src unchanged
+    // (the server-side import path will attempt an S3 upload instead).  No action
+    // is required here.
+    // NOTE: We intentionally retain the conditional structure in case future
+    // logic needs to hook in here.
     if (typeof window === 'undefined' && fs && !src.startsWith('http') && !src.startsWith('data:') && !src.startsWith('/')) {
-      // Node env: try to inline relative image as data URI
-      try {
-        const imagePath = path.resolve(options.destDir || process.cwd(), src);
-        if (fs.existsSync(imagePath)) {
-          const buffer = fs.readFileSync(imagePath);
-          const mimeType = mime.getType(imagePath) || 'application/octet-stream';
-          src = `data:${mimeType};base64,${buffer.toString('base64')}`;
-        }
-      } catch (e) {
-        logger.warn('Image inlining failed', e);
-      }
+      logger.debug && logger.debug('[transform_common] skipping base64 inline for', src);
     }
 
     const outerSpan = document.createElement('span');
