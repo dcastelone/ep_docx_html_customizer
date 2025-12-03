@@ -52,6 +52,64 @@ exports.postAceInit = (hook, context) => {
 
       const doc = new DOMParser().parseFromString(html, 'text/html');
       customizeDocument(doc, {env: 'browser'});
+      
+      // CRITICAL: Regenerate tblId values to prevent conflicts with existing tables
+      // When copying a table from Etherpad and pasting back, the original tblId is preserved
+      // This causes orphan detection to incorrectly merge pasted rows into the original table
+      const regenerateTableIds = (docBody) => {
+        const rand = () => Math.random().toString(36).slice(2, 8);
+        const tblIdMap = new Map(); // oldId -> newId mapping
+        
+        // Find all elements with tbljson-* classes
+        const tbljsonElements = docBody.querySelectorAll('[class*="tbljson-"]');
+        if (tbljsonElements.length > 0 && DEBUG) {
+          console.log('[docx_customizer] regenerating tblIds for', tbljsonElements.length, 'elements');
+        }
+        
+        tbljsonElements.forEach((el) => {
+          const newClasses = [];
+          const oldClasses = el.className.split(/\s+/);
+          
+          oldClasses.forEach((cls) => {
+            if (cls.startsWith('tbljson-')) {
+              try {
+                // Decode the existing metadata
+                const encoded = cls.substring(8);
+                const decoded = dec(encoded);
+                if (decoded) {
+                  const meta = JSON.parse(decoded);
+                  if (meta && meta.tblId) {
+                    // Get or create a new tblId for this old tblId
+                    if (!tblIdMap.has(meta.tblId)) {
+                      tblIdMap.set(meta.tblId, rand() + rand());
+                    }
+                    // Update the tblId
+                    meta.tblId = tblIdMap.get(meta.tblId);
+                    // Re-encode with new tblId
+                    const newEncoded = enc(JSON.stringify(meta));
+                    newClasses.push('tbljson-' + newEncoded);
+                    if (DEBUG) console.debug('[docx_customizer] regenerated tblId', { old: cls.substring(8, 20) + '...', newTblId: meta.tblId });
+                    return;
+                  }
+                }
+              } catch (e) {
+                if (DEBUG) console.warn('[docx_customizer] failed to decode/re-encode tbljson', e);
+              }
+            }
+            // Keep non-tbljson classes as-is
+            newClasses.push(cls);
+          });
+          
+          el.className = newClasses.join(' ');
+        });
+        
+        if (tblIdMap.size > 0 && DEBUG) {
+          console.log('[docx_customizer] regenerated', tblIdMap.size, 'unique tblIds');
+        }
+      };
+      
+      regenerateTableIds(doc.body);
+      
       const cleanedHtml = doc.body.innerHTML;
       if (DEBUG) console.log('[docx_customizer] cleanedHtml length', cleanedHtml.length);
 

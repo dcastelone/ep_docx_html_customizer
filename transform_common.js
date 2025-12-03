@@ -472,9 +472,48 @@ function customizeDocument(document, options = {}) {
   const tables = document.querySelectorAll('table');
   if (tables.length) {
     const tblIdBase = rand();
+    
+    // Group tables by data-tblid attribute (for Etherpad copy/paste where each row is a separate <table>)
+    // Tables without data-tblid get grouped by their index
+    const tableGroups = new Map(); // groupKey -> { tables: [] }
     tables.forEach((tableNode, tableIdx) => {
-      const rows = tableNode.querySelectorAll('tr');
-      if (!rows.length) return;
+      const existingTblId = tableNode.getAttribute('data-tblid') || tableNode.getAttribute('data-tblId');
+      const groupKey = existingTblId || `new-${tableIdx}`;
+      if (!tableGroups.has(groupKey)) {
+        tableGroups.set(groupKey, { tables: [] });
+      }
+      tableGroups.get(groupKey).tables.push(tableNode);
+    });
+    
+    let groupIdx = 0;
+    tableGroups.forEach((group) => {
+      const { tables: groupTables } = group;
+      
+      // Sort by data-row if present to ensure correct row order
+      groupTables.sort((a, b) => {
+        const rowA = parseInt(a.getAttribute('data-row') || '0', 10);
+        const rowB = parseInt(b.getAttribute('data-row') || '0', 10);
+        return rowA - rowB;
+      });
+      
+      // Collect all rows from all tables in this group
+      const allRows = [];
+      groupTables.forEach((tn) => {
+        const trs = tn.querySelectorAll('tr');
+        trs.forEach((tr) => allRows.push({ row: tr, tableNode: tn }));
+      });
+      
+      if (!allRows.length) {
+        groupIdx++;
+        return;
+      }
+      
+      const tableNode = groupTables[0]; // Use first table for replacement anchor
+      const rows = allRows.map((r) => r.row);
+      if (!rows.length) {
+        groupIdx++;
+        return;
+      }
 
       // helper to get logical column count taking colspan into account
       const getLogicalCols = (tr) => Array.from(tr.querySelectorAll('td, th')).reduce((cnt, c) => {
@@ -486,7 +525,10 @@ function customizeDocument(document, options = {}) {
         const cols = getLogicalCols(tr);
         return cols > max ? cols : max;
       }, 0);
-      if (!numCols) return;
+      if (!numCols) {
+        groupIdx++;
+        return;
+      }
 
       const pendingRowspan = Array(numCols).fill(0);
       const newLines = [];
@@ -542,6 +584,36 @@ function customizeDocument(document, options = {}) {
           html = flatten(tmp);
           if (/^<br\/?>(\s*)?$/i.test(html)) html = '';
           if (html) html = html.replace(/(<br\s*\/?>\s*)+$/gi, '').replace(/<br\s*\/?>/gi, ' ').trim();
+          
+          // CRITICAL: Strip any existing tbljson-* and tblCell-* classes from nested content.
+          // This prevents double-wrapping when copying a table from Etherpad and pasting it back.
+          // Without this fix, old tbljson spans get nested inside new ones, causing:
+          // - Multiple tblIds per row (each cell gets different tblId during regeneration)
+          // - Segment/column mismatches during rendering
+          if (html) {
+            const stripDiv = document.createElement('div');
+            stripDiv.innerHTML = html;
+            const tbljsonSpans = stripDiv.querySelectorAll('[class*="tbljson-"], [class*="tblCell-"]');
+            tbljsonSpans.forEach((sp) => {
+              // Remove tbljson-* and tblCell-* classes but keep other classes
+              const newClasses = (sp.className || '').split(/\s+/).filter((c) => {
+                return c && !c.startsWith('tbljson-') && !c.startsWith('tblCell-');
+              });
+              if (newClasses.length > 0) {
+                sp.className = newClasses.join(' ');
+              } else {
+                // No classes left - unwrap the span, keeping its content
+                const parent = sp.parentNode;
+                while (sp.firstChild) {
+                  parent.insertBefore(sp.firstChild, sp);
+                }
+                parent.removeChild(sp);
+              }
+            });
+            // Also remove delimiter characters and UI elements that might be in the cell content
+            stripDiv.querySelectorAll('.ep-data_tables-delim, .ep-data_tables-caret-anchor, .ep-data_tables-resize-handle').forEach((d) => d.remove());
+            html = stripDiv.innerHTML.replace(/\u241F/g, '').trim();
+          }
 
           let visiblyEmpty = false;
           if (!html) {
@@ -565,7 +637,7 @@ function customizeDocument(document, options = {}) {
           col += colspan - 1;
         }
 
-        const meta = {tblId: `${tblIdBase}-${tableIdx}`, row: rowIdx, cols: numCols};
+        const meta = {tblId: `${tblIdBase}-${groupIdx}`, row: rowIdx, cols: numCols};
         const encodedMeta = enc(JSON.stringify(meta));
         const lineDiv = document.createElement('div');
         
@@ -592,8 +664,16 @@ function customizeDocument(document, options = {}) {
         const frag = document.createDocumentFragment();
         newLines.forEach(d=>frag.appendChild(d));
         tableNode.parentNode.replaceChild(frag, tableNode);
+        // Remove any additional tables in this group (they're now combined into one)
+        for (let i = 1; i < groupTables.length; i++) {
+          const extraTable = groupTables[i];
+          if (extraTable.parentNode) {
+            extraTable.parentNode.removeChild(extraTable);
+          }
+        }
         modified = true;
       }
+      groupIdx++;
     });
   }
 
