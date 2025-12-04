@@ -202,7 +202,10 @@ exports.postAceInit = (hook, context) => {
             }
             sp.className = sp.className.replace(m[1], encodeURIComponent(finalUrl));
           } catch (e) {
-            if (DEBUG) console.warn('[docx_customizer] failed to inline', url, e);
+            // S3 upload failed - replace image span with warning emoji (never fall back to base64)
+            console.warn('[docx_customizer] S3 upload failed for image, replacing with warning:', url, e);
+            const warning = document.createTextNode('⚠️');
+            sp.parentNode.replaceChild(warning, sp);
           }
         }));
         return tmp.innerHTML;
