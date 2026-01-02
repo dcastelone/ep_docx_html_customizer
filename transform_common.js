@@ -421,6 +421,27 @@ function customizeDocument(document, options = {}) {
     return best;
   };
 
+  // Check if a color is a known theme color that should be skipped.
+  // These are colors from the Colibris/Etherpad theme that get computed by Chrome
+  // when copying content, and should not be treated as user-applied formatting.
+  const isThemeColor = (rgb) => {
+    if (!rgb) return false;
+    // Theme colors that Chrome may compute when copying Etherpad content:
+    const themeColors = [
+      [100, 210, 155],  // #64d29b - Colibris primary/heading color
+      [16, 53, 114],    // #103572 - Colibris tweaked h1 color
+      [72, 83, 101],    // #485365 - Colibris default text color (--text-color)
+      [87, 98, 115],    // #576273 - Colibris dark color (--dark-color)
+      [55, 66, 86],     // #374256 - Colibris super-dark color variant
+    ];
+    const TOLERANCE = 30; // Allow colors within this distance
+    for (const tc of themeColors) {
+      const d = Math.sqrt((rgb[0]-tc[0])**2 + (rgb[1]-tc[1])**2 + (rgb[2]-tc[2])**2);
+      if (d <= TOLERANCE) return true;
+    }
+    return false;
+  };
+
   const parsePx = (val)=>{
     if(!val) return null;
     const m=/([0-9.]+)(px|pt)?/i.exec(val);
@@ -431,17 +452,38 @@ function customizeDocument(document, options = {}) {
     return Math.round(num);
   };
 
+  // Heading font sizes in px (ep_headings2 uses em values that compute to these at 16px base):
+  // h1: 2.5em ≈ 40px, h2: 1.8em ≈ 29px, h3: 1.5em ≈ 24px, h4: 1.2em ≈ 19px
+  // Chrome computes and serializes these when copying headings, which then get mapped to:
+  // h1→40, h2→26/28, h3→22/24, h4→18/20. We skip these "heading-like" sizes.
+  const HEADING_FONT_SIZES = new Set([18, 19, 20, 22, 24, 26, 28, 29, 40]);
+
   const styledNodes = Array.from(document.querySelectorAll('[style*="color"], font[color], [style*="font-size"]'));
   styledNodes.forEach((el)=>{
+    // Skip elements inside headings - their color/font-size comes from heading CSS,
+    // not user-applied formatting. Chrome computes these styles when copying, which
+    // causes spurious color:green/font-size:26 classes to appear on pasted headings.
+    const insideHeading = el.closest && el.closest('h1, h2, h3, h4, h5, h6');
+    if (insideHeading) return;
+
     const classes=(el.className||'').split(/\s+/).filter(Boolean);
     let changed=false;
+    
     const colorAttr=el.getAttribute('color')||el.style.color;
     if(colorAttr){
       const rgb=parseColorToRgb(colorAttr);
-      const mapped=findNearestColor(rgb);
-      if(mapped && mapped!=='black'){
-        const cls=`color:${mapped}`;
-        if(!classes.includes(cls)){classes.push(cls);changed=true;}
+      // Skip theme colors (like Colibris heading color #64d29b) - these are computed
+      // by Chrome when copying and should not be treated as user-applied formatting
+      if (isThemeColor(rgb)) {
+        el.style.color = '';
+        el.removeAttribute('color');
+        // Don't add color class - continue to check font-size
+      } else {
+        const mapped=findNearestColor(rgb);
+        if(mapped && mapped!=='black'){
+          const cls=`color:${mapped}`;
+          if(!classes.includes(cls)){classes.push(cls);changed=true;}
+        }
       }
     }
     // Skip font-size mapping for <sup>/<sub> to preserve normal baseline sizing
@@ -450,12 +492,20 @@ function customizeDocument(document, options = {}) {
     if(sizeStyle){
       const px=parsePx(sizeStyle);
       if(px){
-        const palette=[8,9,10,11,12,14,16,18,20,22,24,26,28,30,35,40];
-        let best=palette[0],bestDiff=Math.abs(px-best);
-        for(const s of palette){ const d=Math.abs(px-s); if(d<bestDiff){best=s;bestDiff=d;} }
-        if(best!==14){
-          const cls=`font-size:${best}`;
-          if(!classes.includes(cls)){classes.push(cls);changed=true;}
+        // Skip heading-like font sizes - these are computed from heading CSS
+        // by Chrome when copying, not user-applied formatting.
+        // ep_headings2 sizes: h1=2.5em(~40px), h2=1.8em(~29px), h3=1.5em(~24px), h4=1.2em(~19px)
+        if (HEADING_FONT_SIZES.has(px)) {
+          el.style.fontSize = '';
+          // Don't add font-size class, but continue processing
+        } else {
+          const palette=[8,9,10,11,12,14,16,18,20,22,24,26,28,30,35,40];
+          let best=palette[0],bestDiff=Math.abs(px-best);
+          for(const s of palette){ const d=Math.abs(px-s); if(d<bestDiff){best=s;bestDiff=d;} }
+          if(best!==14){
+            const cls=`font-size:${best}`;
+            if(!classes.includes(cls)){classes.push(cls);changed=true;}
+          }
         }
       }
     }
@@ -465,6 +515,58 @@ function customizeDocument(document, options = {}) {
       el.style.color='';
       el.style.fontSize='';
       modified=true;
+    }
+  });
+
+  /* ───────────── Strip heading-derived classes from existing content ─────────────
+   * When copying from Etherpad, Chrome may preserve existing class-based styling
+   * (color:green, font-size:26, etc.) that was derived from heading CSS in a previous
+   * paste cycle. We need to strip these to prevent style accumulation.
+   */
+  const headingFontSizeClasses = new Set([
+    'font-size:18', 'font-size:19', 'font-size:20', 'font-size:22', 
+    'font-size:24', 'font-size:26', 'font-size:28', 'font-size:29', 'font-size:40'
+  ]);
+  
+  // Strip heading-derived classes from spans inside headings
+  document.querySelectorAll('h1 span, h2 span, h3 span, h4 span, h5 span, h6 span').forEach((span) => {
+    const classes = (span.className || '').split(/\s+/).filter(Boolean);
+    const filtered = classes.filter((c) => {
+      // Remove heading-like font sizes
+      if (headingFontSizeClasses.has(c)) return false;
+      // Remove green color (Colibris heading color)
+      if (c === 'color:green') return false;
+      return true;
+    });
+    if (filtered.length !== classes.length) {
+      span.className = filtered.join(' ');
+      modified = true;
+    }
+  });
+  
+  // Also strip from Etherpad content (author-* class) that has heading-like styling
+  // but lost its heading wrapper during copy
+  document.querySelectorAll('[class*="author-"]').forEach((el) => {
+    const classes = (el.className || '').split(/\s+/).filter(Boolean);
+    const hasAuthorClass = classes.some(c => c.startsWith('author-'));
+    if (!hasAuthorClass) return;
+    
+    // Check if element is inside a heading - if so, strip all heading-derived classes
+    const insideHeading = el.closest && el.closest('h1, h2, h3, h4, h5, h6');
+    
+    const filtered = classes.filter((c) => {
+      if (insideHeading) {
+        // Remove heading-like font sizes
+        if (headingFontSizeClasses.has(c)) return false;
+        // Remove green color
+        if (c === 'color:green') return false;
+      }
+      return true;
+    });
+    
+    if (filtered.length !== classes.length) {
+      el.className = filtered.join(' ');
+      modified = true;
     }
   });
 
