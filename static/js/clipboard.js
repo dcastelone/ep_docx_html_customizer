@@ -11,6 +11,7 @@ const ATTR_TABLE_JSON = 'tbljson';
 const DELIMITER = '\u241F'; // same invisible delimiter used by ep_tables5
 const ATTR_CELL = 'td';
 const DEBUG = true;
+const IS_SAFARI = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
 
 // Base64 decode helper (URL-safe) reused by table logic
 const dec = (s) => {
@@ -42,16 +43,21 @@ exports.postAceInit = (hook, context) => {
 
     $innerBody.on('paste', (evt) => {
       const clipboardData = evt.originalEvent.clipboardData;
-      if (!clipboardData || !clipboardData.types.includes('text/html')) return;
+      // Safari returns a DOMStringList (not Array) for .types — use Array.from for cross-browser compat
+      const types = clipboardData && clipboardData.types ? Array.from(clipboardData.types) : [];
+      if (!clipboardData || !types.includes('text/html')) return;
       const html = clipboardData.getData('text/html');
       if (!html) return;
 
       if (DEBUG) console.log('[docx_customizer] paste event captured with HTML');
+      if (DEBUG) console.log('[docx_customizer] raw clipboard HTML:', html.substring(0, 300));
       evt.preventDefault();
       evt.stopImmediatePropagation();
 
       const doc = new DOMParser().parseFromString(html, 'text/html');
+      if (DEBUG) console.log('[docx_customizer] DOMParser tables found:', doc.querySelectorAll('table').length);
       customizeDocument(doc, {env: 'browser'});
+      if (DEBUG) console.log('[docx_customizer] after customizeDocument, tbljson elements:', doc.querySelectorAll('[class*="tbljson-"]').length);
       
       // CRITICAL: Regenerate tblId values to prevent conflicts with existing tables
       // When copying a table from Etherpad and pasting back, the original tblId is preserved
@@ -109,13 +115,112 @@ exports.postAceInit = (hook, context) => {
       };
       
       regenerateTableIds(doc.body);
-      
+
+      // ── Safari-only: normalize clipboard HTML ──
+      // Safari produces different clipboard HTML from Google Docs (wrapped in <b>,
+      // verbose computed styles, nested block elements) that triggers WebKit bugs.
+      if (IS_SAFARI) {
+        // 1. Strip Google Docs <b> wrapper
+        const gdocWrapper = doc.body.querySelector('b[id^="docs-internal-guid-"]');
+        if (gdocWrapper) {
+          while (gdocWrapper.firstChild) {
+            gdocWrapper.parentNode.insertBefore(gdocWrapper.firstChild, gdocWrapper);
+          }
+          gdocWrapper.parentNode.removeChild(gdocWrapper);
+        }
+
+        // 2. Strip clipboard preamble
+        doc.body.querySelectorAll('meta, br[id^="docs-internal-guid-"]').forEach((el) => el.remove());
+        const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_COMMENT, null, false);
+        const comments = [];
+        while (walker.nextNode()) comments.push(walker.currentNode);
+        comments.forEach((c) => c.remove());
+        while (doc.body.firstChild && doc.body.firstChild.nodeName === 'BR') {
+          doc.body.removeChild(doc.body.firstChild);
+        }
+
+        // 3. Unwrap outer Google Docs container div
+        // Row divs must be top-level so execCommand doesn't crash on nested blocks.
+        // We add ace-line class post-insertion to satisfy ep_data_tables' orphan detection.
+        if (doc.body.querySelector('[class*="tbljson-"]')) {
+          Array.from(doc.body.children).forEach((el) => {
+            if (el.nodeName !== 'DIV') return;
+            if ((el.className || '').includes('tbljson-')) return;
+            const childRowDivs = el.querySelectorAll(':scope > div > [class*="tbljson-"]');
+            if (!childRowDivs.length) return;
+            while (el.firstChild) {
+              el.parentNode.insertBefore(el.firstChild, el);
+            }
+            el.parentNode.removeChild(el);
+            if (DEBUG) console.log('[docx_customizer] unwrapped outer Google Docs <div> container');
+          });
+        }
+
+        // 4. Strip verbose default-value inline styles
+        const KEEP_STYLE_PROPS = new Set([
+          'font-size', 'font-family', 'font-weight', 'font-style',
+          'color', 'background-color', 'text-decoration',
+          'vertical-align', 'white-space',
+        ]);
+        doc.body.querySelectorAll('[class*="tbljson-"] span[style]').forEach((span) => {
+          const keep = [];
+          for (let i = 0; i < span.style.length; i++) {
+            const prop = span.style[i];
+            if (KEEP_STYLE_PROPS.has(prop)) {
+              keep.push(`${prop}:${span.style.getPropertyValue(prop)}`);
+            }
+          }
+          if (keep.length > 0) {
+            span.setAttribute('style', keep.join(';'));
+          } else {
+            span.removeAttribute('style');
+          }
+        });
+      }
+
+      // 5. (Safari only) Protect U+241F delimiter from innerHTML corruption.
+      //    Safari's innerHTML serializer replaces U+241F with '?'. We swap delimiter
+      //    text nodes for placeholder <span> elements before serialization, then
+      //    restore U+241F in the resulting HTML string.
+      const _protectDelimiters = (root) => {
+        if (!IS_SAFARI) return;
+        const tw = (root.ownerDocument || root).createTreeWalker(root, NodeFilter.SHOW_TEXT, null, false);
+        const nodes = [];
+        while (tw.nextNode()) {
+          if (tw.currentNode.textContent.includes(DELIMITER)) nodes.push(tw.currentNode);
+        }
+        nodes.forEach((tn) => {
+          const parts = tn.textContent.split(DELIMITER);
+          const frag = (tn.ownerDocument || document).createDocumentFragment();
+          parts.forEach((part, i) => {
+            if (part) frag.appendChild((tn.ownerDocument || document).createTextNode(part));
+            if (i < parts.length - 1) {
+              const m = (tn.ownerDocument || document).createElement('span');
+              m.setAttribute('data-ep-delim', '1');
+              frag.appendChild(m);
+            }
+          });
+          tn.parentNode.replaceChild(frag, tn);
+        });
+      };
+      // Convert placeholders to HTML entity &#x241F; — only for the FINAL output.
+      // The entity survives as a string and createContextualFragment decodes it
+      // to real U+241F in the DOM. We must NOT restore raw U+241F mid-pipeline
+      // because any subsequent innerHTML round-trip would corrupt it again.
+      const _restoreDelimitersForInsert = (html) => IS_SAFARI
+        ? html.replace(/<span data-ep-delim="1"><\/span>/g, '&#x241F;')
+        : html;
+
+      _protectDelimiters(doc.body);
+      if (DEBUG) console.log('[docx_customizer] normalized clipboard HTML');
+      // Keep placeholders in cleanedHtml — do NOT restore yet
       const cleanedHtml = doc.body.innerHTML;
       if (DEBUG) console.log('[docx_customizer] cleanedHtml length', cleanedHtml.length);
 
       const inlineImages = async (html) => {
         const tmp = document.createElement('div');
         tmp.innerHTML = html;
+        // Placeholders survive innerHTML parse as real <span> elements — no re-protection needed
         const spans = tmp.querySelectorAll('span[class*="image:"]');
         const imageSpans = Array.from(spans);
         const totalImages = imageSpans.length;
@@ -208,10 +313,12 @@ exports.postAceInit = (hook, context) => {
             sp.parentNode.replaceChild(warning, sp);
           }
         }));
-        return tmp.innerHTML;
+        return tmp.innerHTML; // placeholders still in place
       };
 
-      inlineImages(cleanedHtml).then((finalHtml) => {
+      inlineImages(cleanedHtml).then((rawHtml) => {
+        // NOW restore delimiters — final step before insertion, no more innerHTML round-trips
+        const finalHtml = _restoreDelimitersForInsert(rawHtml);
         context.ace.callWithAce((ace) => {
           let insideTableCell = false;
           try {
@@ -396,8 +503,83 @@ exports.postAceInit = (hook, context) => {
             }
           } else {
             ace.ace_inCallStackIfNecessary('docxPaste', () => {
-              const innerWin = $innerIframe[0].contentWindow;
-              innerWin.document.execCommand('insertHTML', false, finalHtml);
+              try {
+                const innerWin = $innerIframe[0].contentWindow;
+                if (DEBUG) console.log('[docx_customizer] about to insert, length:', finalHtml.length);
+                if (DEBUG) console.log('[docx_customizer] insert snippet:', finalHtml.substring(0, 500));
+
+                if (IS_SAFARI) {
+                  // Safari: use Range API. execCommand('insertHTML') destroys content
+                  // on Safari (only 1 of 3 rows survives, cells emptied).
+                  // Range API inserts all content intact.
+                  const sel = innerWin.getSelection();
+                  if (sel && sel.rangeCount) {
+                    const range = sel.getRangeAt(0);
+                    range.deleteContents();
+                    const frag = range.createContextualFragment(finalHtml);
+                    let lastNode = frag.lastChild;
+                    range.insertNode(frag);
+                    if (lastNode) {
+                      const newRange = innerWin.document.createRange();
+                      newRange.setStartAfter(lastNode);
+                      newRange.collapse(true);
+                      sel.removeAllRanges();
+                      sel.addRange(newRange);
+                    }
+                  }
+                  // Range API creates standalone divs without ace-line class.
+                  // ep_data_tables' collectContentLineText suppresses tbljson content
+                  // in orphan spans unless parentEl.closest('div.ace-line') succeeds.
+                  // Tag the new divs before content collection runs.
+                  const edBody = innerWin.document.body;
+                  Array.from(edBody.children).forEach((child) => {
+                    if (child.nodeName === 'DIV' && !child.classList.contains('ace-line') &&
+                        child.querySelector('[class*="tbljson-"]')) {
+                      child.classList.add('ace-line');
+                      if (DEBUG) console.log('[docx_customizer] added ace-line class to standalone div');
+                    }
+                  });
+                  ace.ace_fastIncorp && ace.ace_fastIncorp(10);
+                  if (DEBUG) console.log('[docx_customizer] Safari range insert succeeded');
+                } else {
+                  innerWin.document.execCommand('insertHTML', false, finalHtml);
+                  if (DEBUG) console.log('[docx_customizer] insertHTML succeeded');
+                }
+
+                // ── POST-INSERT DIAGNOSTIC: compare DOM state across browsers ──
+                if (DEBUG) {
+                  try {
+                    const edBody = innerWin.document.body;
+                    // 1. Count tbljson elements in editor DOM after insertion
+                    const tblEls = edBody.querySelectorAll('[class*="tbljson-"]');
+                    console.log('[docx_customizer] POST-INSERT: tbljson elements in DOM:', tblEls.length);
+                    // 2. Check delimiter survival via textContent (no innerHTML corruption)
+                    const bodyText = edBody.textContent || '';
+                    const delimCount = (bodyText.match(/\u241F/g) || []).length;
+                    console.log('[docx_customizer] POST-INSERT: U+241F count in textContent:', delimCount);
+                    // 3. Dump first tbljson element's class and text
+                    if (tblEls.length > 0) {
+                      console.log('[docx_customizer] POST-INSERT: first tbljson class:', tblEls[0].className);
+                      console.log('[docx_customizer] POST-INSERT: first tbljson text:', JSON.stringify(tblEls[0].textContent));
+                    }
+                    // 4. Log child structure of body (first 10 children)
+                    const children = Array.from(edBody.children).slice(0, 10);
+                    console.log('[docx_customizer] POST-INSERT: body children:', children.map((c) => `${c.nodeName}.${(c.className || '').substring(0, 40)}`).join(' | '));
+                    // 5. innerHTML of first line that has tbljson (to see what Etherpad will read)
+                    for (const child of edBody.children) {
+                      if (child.querySelector && child.querySelector('[class*="tbljson-"]')) {
+                        console.log('[docx_customizer] POST-INSERT: first table line innerHTML:', child.innerHTML.substring(0, 300));
+                        break;
+                      }
+                    }
+                  } catch (diagErr) {
+                    console.warn('[docx_customizer] POST-INSERT diagnostic error:', diagErr);
+                  }
+                }
+              } catch (insertErr) {
+                console.error('[docx_customizer] insert failed:', insertErr);
+                console.error('[docx_customizer] failing HTML:', finalHtml);
+              }
             });
           }
         }, 'docxPaste', true);
