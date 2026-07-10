@@ -397,7 +397,13 @@ function customizeDocument(document, options = {}) {
   const parseColorToRgb = (str) => {
     if (!str) return null;
     const s = str.toLowerCase().trim();
-    const named = {black:[0,0,0], red:[255,0,0], green:[0,128,0], blue:[0,0,255], yellow:[255,255,0], orange:[255,165,0]};
+    const named = {
+      black:[0,0,0], white:[255,255,255], red:[255,0,0], green:[0,128,0],
+      blue:[0,0,255], yellow:[255,255,0], orange:[255,165,0],
+      purple:[128,0,128], gray:[128,128,128], grey:[128,128,128],
+      lime:[0,255,0], cyan:[0,255,255], magenta:[255,0,255],
+      maroon:[128,0,0], navy:[0,0,128],
+    };
     if (named[s]) return named[s];
     const hex = s.match(/^#?([0-9a-f]{3}|[0-9a-f]{6})$/i);
     if (hex) {
@@ -410,15 +416,10 @@ function customizeDocument(document, options = {}) {
     return null;
   };
 
-  const findNearestColor = (rgb) => {
+  const rgbToHexColor = (rgb) => {
     if (!rgb) return null;
-    const palette = {black:[0,0,0], red:[255,0,0], green:[0,128,0], blue:[0,0,255], yellow:[255,255,0], orange:[255,165,0]};
-    let best='black',bestDist=1e9;
-    for(const [name,p] of Object.entries(palette)){
-      const d=Math.sqrt((rgb[0]-p[0])**2+(rgb[1]-p[1])**2+(rgb[2]-p[2])**2);
-      if(d<bestDist){bestDist=d;best=name;}
-    }
-    return best;
+    const parts = rgb.map((value) => Math.max(0, Math.min(255, Number(value) || 0)));
+    return `#${parts.map((value) => value.toString(16).padStart(2, '0')).join('')}`;
   };
 
   // Check if a color is a known theme color that should be skipped.
@@ -479,9 +480,9 @@ function customizeDocument(document, options = {}) {
         el.removeAttribute('color');
         // Don't add color class - continue to check font-size
       } else {
-        const mapped=findNearestColor(rgb);
-        if(mapped && mapped!=='black'){
-          const cls=`color:${mapped}`;
+        const nativeColor=rgbToHexColor(rgb);
+        if(nativeColor){
+          const cls=`color:${nativeColor}`;
           if(!classes.includes(cls)){classes.push(cls);changed=true;}
         }
       }

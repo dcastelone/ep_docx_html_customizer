@@ -497,8 +497,6 @@ exports.import = async (hookName, context) => {
     /* ────────────────────────── Font color & size processing ────────────────────────── */
     logger.info(`[ep_docx_html_customizer] Processing converted HTML at ${destFile} for font colors and sizes.`);
     
-    const COLOR_CLASSES = ['black', 'red', 'green', 'blue', 'yellow', 'orange'];
-    
     // Helper to parse CSS color values to RGB
     const parseColorToRgb = (colorStr) => {
       if (!colorStr) return null;
@@ -534,31 +532,11 @@ exports.import = async (hookName, context) => {
       
       return null;
     };
-    
-    // Helper to find nearest color class by RGB distance
-    const findNearestColor = (rgb) => {
+
+    const rgbToHexColor = (rgb) => {
       if (!rgb) return null;
-      const colorPalette = {
-        black: [0, 0, 0], red: [255, 0, 0], green: [0, 128, 0],
-        blue: [0, 0, 255], yellow: [255, 255, 0], orange: [255, 165, 0]
-      };
-      
-      let bestColor = 'black';
-      let bestDistance = Infinity;
-      
-      for (const [colorName, paletteRgb] of Object.entries(colorPalette)) {
-        const distance = Math.sqrt(
-          Math.pow(rgb[0] - paletteRgb[0], 2) +
-          Math.pow(rgb[1] - paletteRgb[1], 2) +
-          Math.pow(rgb[2] - paletteRgb[2], 2)
-        );
-        if (distance < bestDistance) {
-          bestDistance = distance;
-          bestColor = colorName;
-        }
-      }
-      
-      return bestColor;
+      const parts = rgb.map((value) => Math.max(0, Math.min(255, Number(value) || 0)));
+      return `#${parts.map((value) => value.toString(16).padStart(2, '0')).join('')}`;
     };
 
     const parsePx = (val) => {
@@ -586,14 +564,14 @@ exports.import = async (hookName, context) => {
         // Remove any existing color: classes
         const filteredClasses = newClasses.filter(cls => !cls.startsWith('color:'));
         const rgb = parseColorToRgb(colorAttr);
-        const mappedColor = findNearestColor(rgb);
+        const nativeColor = rgbToHexColor(rgb);
         
-        if (mappedColor) {
-          filteredClasses.push(`color:${mappedColor}`);
+        if (nativeColor) {
+          filteredClasses.push(`color:${nativeColor}`);
           newClasses.length = 0;
           newClasses.push(...filteredClasses);
           modified = true;
-          logger.debug(`[ep_docx_html_customizer] Node ${idx + 1}: mapped color "${colorAttr}" to "${mappedColor}"`);
+          logger.debug(`[ep_docx_html_customizer] Node ${idx + 1}: preserved color "${colorAttr}" as "${nativeColor}"`);
         }
       }
 
