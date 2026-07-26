@@ -851,7 +851,6 @@ exports.eejsBlock_body = (hookName, args, cb) => {
 };
 
 exports.expressCreateServer = (hookName, {app}) => {
-  console.log('[docx_customizer] expressCreateServer – setting up /ep_docx_image_proxy');
   logger.info('[ep_docx_html_customizer] expressCreateServer hook: registering /ep_docx_image_proxy route');
   const FETCH_TIMEOUT_MS = 10000;
   const RATE_LIMIT_WINDOW_MS = 60 * 1000;          // 1 minute sliding window

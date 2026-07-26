@@ -280,10 +280,6 @@ function customizeDocument(document, options = {}) {
     });
   } catch (e) { /* swallow but log */ console.warn('[transform_common] CSS parse error', e); }
 
-  if (typeof console !== 'undefined' && console.debug) {
-    console.debug('[transform_common] cssImageSizeMap keys', Object.keys(cssImageSizeMap).length);
-  }
-
   const images = document.querySelectorAll('img');
   images.forEach((img) => {
     let src = img.getAttribute('src');
@@ -316,10 +312,6 @@ function customizeDocument(document, options = {}) {
     let imgWidthAttr  = img.getAttribute('width')  || (img.style && img.style.width)  || '';
     let imgHeightAttr = img.getAttribute('height') || (img.style && img.style.height) || '';
 
-    if (typeof console !== 'undefined' && console.debug) {
-      console.debug('[transform_common] <img> initial dims', {src, width: imgWidthAttr, height: imgHeightAttr, classList: img.className});
-    }
-
     // Fallback to CSS rule–declared sizes if direct attrs missing
     if (!imgWidthAttr || !imgHeightAttr) {
       const classesImg = (img.className || '').split(/\s+/).filter(Boolean);
@@ -328,9 +320,6 @@ function customizeDocument(document, options = {}) {
         if (entry) {
           if (!imgWidthAttr && entry.w)  imgWidthAttr  = entry.w;
           if (!imgHeightAttr && entry.h) imgHeightAttr = entry.h;
-          if (typeof console !== 'undefined' && console.debug) {
-            console.debug('[transform_common] CSS fallback found', {cls: c, w: entry.w, h: entry.h});
-          }
           if (imgWidthAttr && imgHeightAttr) break;
         }
       }
@@ -370,9 +359,6 @@ function customizeDocument(document, options = {}) {
     img.parentNode.replaceChild(frag, img);
     modified = true;
 
-    if (typeof console !== 'undefined' && console.debug) {
-      console.debug('[transform_common] <img> final dims to encode', {width: imgWidthAttr, height: imgHeightAttr});
-    }
   });
 
   /* ───────────── Hyperlinks ───────────── */

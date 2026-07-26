@@ -11,7 +11,7 @@ const {customizeDocument, uploadImageToS3Browser} = require('../../transform_com
 const ATTR_TABLE_JSON = 'tbljson';
 const DELIMITER = '\u241F'; // same invisible delimiter used by ep_tables5
 const ATTR_CELL = 'td';
-const DEBUG = true;
+const DEBUG = false;
 const IS_SAFARI = typeof navigator !== 'undefined' &&
   /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
 
