@@ -12,6 +12,7 @@ Module._load = function(request, parent, isMain) {
   return originalLoad.call(this, request, parent, isMain);
 };
 const {customizeDocument, DELIMITER, ZWSP} = require('../transform_common');
+const {collectContentPre} = require('../static/js/clipboard');
 Module._load = originalLoad;
 
 const transform = (html) => {
@@ -57,4 +58,59 @@ test('normalizes headings, alignment, ordered lists, and super/subscript', () =>
 
 test('returns false for a document requiring no transformation', () => {
   assert.equal(transform('<p>Plain text</p>').modified, false);
+});
+
+test('collects Etherpad inline style classes preserved by table clipboard HTML', () => {
+  const calls = [];
+  const state = {};
+  collectContentPre('collectContentPre', {
+    cls: 'author-a.test b i u s sub sup',
+    state,
+    cc: {doAttrib: (...args) => calls.push(args)},
+  });
+  assert.deepEqual(calls, [
+    [state, 'bold'],
+    [state, 'italic'],
+    [state, 'underline'],
+    [state, 'strikethrough'],
+    [state, 'sub'],
+    [state, 'sup'],
+  ]);
+});
+
+test('emits copied Etherpad table rows as sibling lines and preserves nested styles', () => {
+  const oldMeta = (row) => Buffer.from(JSON.stringify({
+    tblId: 'source-table', row, cols: 2,
+  })).toString('base64');
+  const result = transform([
+    '<div class="ace-line" id="magicdomid1">Before table</div>',
+    '<div class="ace-line" id="magicdomid2">',
+    '<table class="dataTable" data-tblid="source-table" data-row="0"><tbody><tr>',
+    `<td><span class="tbljson-${oldMeta(0)} tblCell-0 b i u">`,
+    '<b><i><u>nested style</u></i></b></span></td>',
+    `<td><span class="tbljson-${oldMeta(0)} tblCell-1">`,
+    '<a href="https://example.com/nested"><b><i>linked style</i></b></a></span></td>',
+    '</tr></tbody></table>',
+    '</div>',
+    '<div class="ace-line" id="magicdomid3">',
+    '<table class="dataTable" data-tblid="source-table" data-row="1"><tbody><tr>',
+    `<td><span class="tbljson-${oldMeta(1)} tblCell-0 sub"><sub>2</sub></span></td>`,
+    `<td><span class="tbljson-${oldMeta(1)} tblCell-1 sup"><sup>3</sup></span></td>`,
+    '</tr></tbody></table>',
+    '</div>',
+    '<div class="ace-line" id="magicdomid4">After table</div>',
+  ].join(''));
+
+  const children = Array.from(result.document.body.children);
+  assert.equal(children.length, 4);
+  assert.equal(children[0].textContent, 'Before table');
+  assert.equal(children[3].textContent, 'After table');
+  assert.equal(result.document.querySelector('.ace-line > div'), null);
+  assert.equal(result.document.querySelector('table'), null);
+  assert.ok(children[1].querySelectorAll('[class*="tbljson-"]').length >= 3);
+  assert.equal(children[2].querySelectorAll('[class*="tbljson-"]').length, 3);
+  assert.ok(children[1].querySelector('b > i > u'));
+  assert.ok(children[1].querySelector('.hyperlink b > i'));
+  assert.ok(children[2].querySelector('sub'));
+  assert.ok(children[2].querySelector('sup'));
 });

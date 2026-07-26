@@ -378,13 +378,14 @@ function customizeDocument(document, options = {}) {
   /* ───────────── Hyperlinks ───────────── */
   const anchors = document.querySelectorAll('a[href]');
   anchors.forEach((a) => {
+    if (a.closest('[class*="hyperlink-"]')) return;
     let href = (a.getAttribute('href') || '').trim();
     if (!href) return;
     if (!/^(https?:\/\/|mailto:|ftp:|file:|#|\/)/i.test(href)) href = `http://${href}`;
     const encodedHref = encodeURIComponent(href);
     const span = document.createElement('span');
     span.className = `hyperlink hyperlink-${encodedHref}`;
-    span.textContent = a.textContent || href;
+    span.innerHTML = a.innerHTML || href;
     const frag = document.createDocumentFragment();
     frag.appendChild(document.createTextNode(ZWSP));
     frag.appendChild(span);
@@ -598,6 +599,15 @@ function customizeDocument(document, options = {}) {
         const rowB = parseInt(b.getAttribute('data-row') || '0', 10);
         return rowA - rowB;
       });
+
+      const sourceLineWrappers = groupTables.map((table) => {
+        const wrapper = table.parentElement;
+        if (!table.classList.contains('dataTable') || !table.hasAttribute('data-row') ||
+            !wrapper || !wrapper.matches('div.ace-line')) return null;
+        return wrapper;
+      });
+      const replaceWholeEtherpadLines = sourceLineWrappers.every(Boolean) &&
+        new Set(sourceLineWrappers).size === groupTables.length;
       
       // Collect all rows from all tables in this group
       const allRows = [];
@@ -659,34 +669,40 @@ function customizeDocument(document, options = {}) {
           if (isNaN(colspan) || colspan < 1) colspan = 1;
           if (isNaN(rowspan) || rowspan < 1) rowspan = 1;
 
-          let html = cell.innerHTML.replace(/\r?\n/g, ' ').trim();
-          const tmp = document.createElement('div');
-          tmp.innerHTML = html;
-          const heading = tmp.querySelector('h1, h2, h3, h4, h5, h6');
-          if (heading) {
-            const cls = (heading.className || '').split(/\s+/).filter(Boolean);
-            if (!cls.includes('bold')) cls.push('bold');
-            const span = document.createElement('span');
-            span.className = cls.join(' ');
-            span.innerHTML = heading.innerHTML.replace(/\r?\n/g, ' ').trim();
-            heading.parentNode.replaceChild(span, heading);
+          let html = cell.innerHTML.replace(/\r?\n/g, replaceWholeEtherpadLines ? '' : ' ');
+          if (!replaceWholeEtherpadLines) {
+            html = html.trim();
+            const tmp = document.createElement('div');
+            tmp.innerHTML = html;
+            const heading = tmp.querySelector('h1, h2, h3, h4, h5, h6');
+            if (heading) {
+              const cls = (heading.className || '').split(/\s+/).filter(Boolean);
+              if (!cls.includes('bold')) cls.push('bold');
+              const span = document.createElement('span');
+              span.className = cls.join(' ');
+              span.innerHTML = heading.innerHTML.replace(/\r?\n/g, ' ').trim();
+              heading.parentNode.replaceChild(span, heading);
+            }
+
+            const flatten = (div) => {
+              const parts = [];
+              div.childNodes.forEach((n) => {
+                if (n.nodeType === 3) {
+                  const t = n.textContent.replace(/\r?\n/g, ' ').trim(); if (t) parts.push(t);
+                } else if (n.tagName && n.tagName.toLowerCase() === 'p') {
+                  const inner = n.innerHTML.replace(/\r?\n/g, ' ').trim(); if (inner) parts.push(inner);
+                } else if (n.outerHTML) { parts.push(n.outerHTML.replace(/\r?\n/g, ' ').trim()); }
+              });
+              return parts.join(' ').trim();
+            };
+
+            html = flatten(tmp);
+            if (/^<br\/?>(\s*)?$/i.test(html)) html = '';
+            if (html) {
+              html = html.replace(/(<br\s*\/?>\s*)+$/gi, '')
+                .replace(/<br\s*\/?>/gi, ' ').trim();
+            }
           }
-
-          const flatten = (div) => {
-            const parts = [];
-            div.childNodes.forEach((n) => {
-              if (n.nodeType === 3) {
-                const t = n.textContent.replace(/\r?\n/g, ' ').trim(); if (t) parts.push(t);
-              } else if (n.tagName && n.tagName.toLowerCase() === 'p') {
-                const inner = n.innerHTML.replace(/\r?\n/g, ' ').trim(); if (inner) parts.push(inner);
-              } else if (n.outerHTML) { parts.push(n.outerHTML.replace(/\r?\n/g, ' ').trim()); }
-            });
-            return parts.join(' ').trim();
-          };
-
-          html = flatten(tmp);
-          if (/^<br\/?>(\s*)?$/i.test(html)) html = '';
-          if (html) html = html.replace(/(<br\s*\/?>\s*)+$/gi, '').replace(/<br\s*\/?>/gi, ' ').trim();
           
           // CRITICAL: Strip any existing tbljson-* and tblCell-* classes from nested content.
           // This prevents double-wrapping when copying a table from Etherpad and pasting it back.
@@ -745,13 +761,30 @@ function customizeDocument(document, options = {}) {
         const lineDiv = document.createElement('div');
         
         cellHTMLs.forEach((cellHTML, cellIdx) => {
-            const span = document.createElement('span');
-            span.className = `tbljson-${encodedMeta} tblCell-${cellIdx}`;
-            span.innerHTML = cellHTML;
-            lineDiv.appendChild(span);
-            if (cellIdx < cellHTMLs.length - 1) {
-                lineDiv.appendChild(document.createTextNode(DELIMITER));
+          const container = document.createElement('div');
+          container.innerHTML = cellHTML;
+          const contentNodes = Array.from(container.childNodes);
+          if (!contentNodes.length) {
+            contentNodes.push(document.createTextNode('\u00A0'));
+          }
+
+          contentNodes.forEach((contentNode) => {
+            let span = contentNode.nodeType === 1 &&
+              contentNode.tagName.toLowerCase() === 'span' ? contentNode : null;
+            if (!span) {
+              span = document.createElement('span');
+              span.appendChild(contentNode);
             }
+            const classes = (span.className || '').split(/\s+/).filter(Boolean)
+              .filter((cls) => !cls.startsWith('tbljson-') && !cls.startsWith('tblCell-'));
+            classes.unshift(`tbljson-${encodedMeta}`, `tblCell-${cellIdx}`);
+            span.className = classes.join(' ');
+            lineDiv.appendChild(span);
+          });
+
+          if (cellIdx < cellHTMLs.length - 1) {
+            lineDiv.appendChild(document.createTextNode(DELIMITER));
+          }
         });
         
         // Add the final, empty span that ep_tables5 expects to exist at the end
@@ -766,12 +799,13 @@ function customizeDocument(document, options = {}) {
       if (newLines.length) {
         const frag = document.createDocumentFragment();
         newLines.forEach(d=>frag.appendChild(d));
-        tableNode.parentNode.replaceChild(frag, tableNode);
+        const replacementAnchor = replaceWholeEtherpadLines ? sourceLineWrappers[0] : tableNode;
+        replacementAnchor.parentNode.replaceChild(frag, replacementAnchor);
         // Remove any additional tables in this group (they're now combined into one)
         for (let i = 1; i < groupTables.length; i++) {
-          const extraTable = groupTables[i];
-          if (extraTable.parentNode) {
-            extraTable.parentNode.removeChild(extraTable);
+          const extraNode = replaceWholeEtherpadLines ? sourceLineWrappers[i] : groupTables[i];
+          if (extraNode.parentNode) {
+            extraNode.parentNode.removeChild(extraNode);
           }
         }
         modified = true;

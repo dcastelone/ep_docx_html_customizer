@@ -1,8 +1,9 @@
 'use strict';
 
-// Clipboard integration for ep_docx_html_customizer – simplified version.
-// We now rely on Etherpad part ordering (our part loads before ep_hyperlinked_text)
-// so we use the same pattern (jQuery .on('paste')) instead of capture-phase hacks.
+// Clipboard integration for ep_docx_html_customizer.
+// Etherpad's own paste listener is registered before client plugin hooks and
+// synchronously inserts formatted HTML. Capture the event first so rich table
+// clipboard content is not inserted once by core and again by this plugin.
 
 const {customizeDocument, uploadImageToS3Browser} = require('../../transform_common');
 
@@ -11,7 +12,8 @@ const ATTR_TABLE_JSON = 'tbljson';
 const DELIMITER = '\u241F'; // same invisible delimiter used by ep_tables5
 const ATTR_CELL = 'td';
 const DEBUG = true;
-const IS_SAFARI = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
+const IS_SAFARI = typeof navigator !== 'undefined' &&
+  /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
 
 // Base64 decode helper (URL-safe) reused by table logic
 const dec = (s) => {
@@ -40,9 +42,11 @@ exports.postAceInit = (hook, context) => {
     if (!$innerIframe.length) return;
     const $innerBody = $innerIframe.contents().find('body');
     if (!$innerBody.length) return;
+    const innerBody = $innerBody[0];
+    if (innerBody._docxCustomizerPasteHandler) return;
 
-    $innerBody.on('paste', (evt) => {
-      const clipboardData = evt.originalEvent.clipboardData;
+    const handlePaste = (evt) => {
+      const clipboardData = (evt.originalEvent || evt).clipboardData;
       // Safari returns a DOMStringList (not Array) for .types — use Array.from for cross-browser compat
       const types = clipboardData && clipboardData.types ? Array.from(clipboardData.types) : [];
       if (!clipboardData || !types.includes('text/html')) return;
@@ -584,13 +588,36 @@ exports.postAceInit = (hook, context) => {
           }
         }, 'docxPaste', true);
       });
-    });
+    };
+    innerBody._docxCustomizerPasteHandler = handlePaste;
+    innerBody.addEventListener('paste', handlePaste, true);
   }, 'setupDocxCustomizerPaste', true);
 };
 
 exports.collectContentPre = (hookName, context) => {
   const {cls, cc, state} = context;
   if (!cls) return;
+
+  const inlineAttributes = {
+    b: 'bold',
+    bold: 'bold',
+    i: 'italic',
+    italic: 'italic',
+    u: 'underline',
+    underline: 'underline',
+    s: 'strikethrough',
+    strikethrough: 'strikethrough',
+    sub: 'sub',
+    sup: 'sup',
+  };
+  const classes = cls.split(/\s+/);
+  const applied = new Set();
+  classes.forEach((className) => {
+    const attribute = inlineAttributes[className];
+    if (!attribute || applied.has(attribute)) return;
+    cc.doAttrib(state, attribute);
+    applied.add(attribute);
+  });
 
   const tblJsonClass = /(?:^| )(tbljson-[^ ]*)/.exec(cls);
   if (tblJsonClass) {
@@ -640,4 +667,4 @@ exports.aceAttribsToClasses = (hook, context) => {
     return [`tblCell-${context.value}`];
   }
   return [];
-}; 
+};
